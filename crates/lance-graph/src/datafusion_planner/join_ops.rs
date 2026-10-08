@@ -56,6 +56,14 @@ impl DataFusionPlanner {
                 |e| self.plan_error(&format!("Failed to scan target node '{}'", target_label), e),
             )?;
 
+        if let Some(mapping) = self.config.get_node_mapping(target_label) {
+            if let Some(filter) = self.mapping_filter(mapping.filter_conditions.as_deref())? {
+                target_builder = target_builder.filter(filter).map_err(|error| {
+                    self.plan_error("Failed to apply graph node mapping filter", error)
+                })?;
+            }
+        }
+
         // Apply target property filters (e.g., (b {age: 30}))
         for (k, v) in target_properties.iter() {
             let lit_expr = super::expression::to_df_value_expr(

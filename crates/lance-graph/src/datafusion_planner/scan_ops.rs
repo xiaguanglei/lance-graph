@@ -8,8 +8,11 @@
 use super::analysis::{PlanningContext, RelationshipInstance};
 use crate::ast::PropertyValue;
 use crate::case_insensitive::qualify_column;
+use crate::config::RelationshipMapping;
 use crate::error::Result;
-use datafusion::logical_expr::{col, BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator};
+use datafusion::logical_expr::{
+    col, lit, BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator,
+};
 use lance_graph_catalog::GraphSourceCatalog;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -18,6 +21,119 @@ use std::sync::Arc;
 use super::DataFusionPlanner;
 
 impl DataFusionPlanner {
+    /// Convert the deliberately small, safe mapping-filter grammar into a
+    /// DataFusion expression. Mappings can be supplied inline by clients, so
+    /// arbitrary SQL must not be evaluated in the planning context.
+    ///
+    /// Supported forms are `field OP literal`, `field IS [NOT] NULL`, joined
+    /// with uppercase `AND`; `OP` is `=`, `!=`, `<>`, `<`, `<=`, `>` or `>=`.
+    pub(crate) fn mapping_filter(&self, condition: Option<&str>) -> Result<Option<Expr>> {
+        let Some(condition) = condition.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let predicates = condition
+            .split(" AND ")
+            .map(|predicate| self.mapping_predicate(predicate.trim()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(predicates.into_iter().reduce(|left, right| {
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(left),
+                op: Operator::And,
+                right: Box::new(right),
+            })
+        }))
+    }
+
+    pub(crate) fn relationship_mapping_filter(
+        &self,
+        mapping: &RelationshipMapping,
+    ) -> Result<Option<Expr>> {
+        let mut predicates = self
+            .mapping_filter(mapping.filter_conditions.as_deref())?
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(type_field) = mapping.type_field.as_deref() {
+            self.validate_mapping_field(type_field)?;
+            predicates.push(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col(type_field)),
+                op: Operator::Eq,
+                right: Box::new(lit(mapping.relationship_type.clone())),
+            }));
+        }
+        Ok(predicates.into_iter().reduce(|left, right| {
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(left),
+                op: Operator::And,
+                right: Box::new(right),
+            })
+        }))
+    }
+
+    fn mapping_predicate(&self, raw: &str) -> Result<Expr> {
+        let tokens = raw.split_whitespace().collect::<Vec<_>>();
+        let (field, operator, literal) = match tokens.as_slice() {
+            [field, "IS", "NULL"] | [field, "is", "null"] => {
+                self.validate_mapping_field(field)?;
+                return Ok(Expr::IsNull(Box::new(col(*field))));
+            }
+            [field, "IS", "NOT", "NULL"] | [field, "is", "not", "null"] => {
+                self.validate_mapping_field(field)?;
+                return Ok(Expr::IsNotNull(Box::new(col(*field))));
+            }
+            [field, operator, literal] => (*field, *operator, *literal),
+            _ => return Err(self.plan_error("Invalid graph mapping filter", raw)),
+        };
+        self.validate_mapping_field(field)?;
+        let operator = match operator {
+            "=" => Operator::Eq,
+            "!=" | "<>" => Operator::NotEq,
+            ">" => Operator::Gt,
+            ">=" => Operator::GtEq,
+            "<" => Operator::Lt,
+            "<=" => Operator::LtEq,
+            _ => return Err(self.plan_error("Unsupported graph mapping filter operator", operator)),
+        };
+        Ok(Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col(field)),
+            op: operator,
+            right: Box::new(self.mapping_literal(literal)?),
+        }))
+    }
+
+    fn validate_mapping_field(&self, field: &str) -> Result<()> {
+        let valid = !field.is_empty()
+            && field.chars().enumerate().all(|(index, character)| {
+                character == '_'
+                    || (character.is_ascii_alphanumeric()
+                        && (index > 0 || !character.is_ascii_digit()))
+            });
+        valid
+            .then_some(())
+            .ok_or_else(|| self.plan_error("Invalid graph mapping filter field", field))
+    }
+
+    fn mapping_literal(&self, raw: &str) -> Result<Expr> {
+        if let Some(value) = raw
+            .strip_prefix('\'')
+            .and_then(|value| value.strip_suffix('\''))
+        {
+            if !value.contains('\'') {
+                return Ok(lit(value.to_owned()));
+            }
+        }
+        match raw {
+            "true" | "TRUE" => Ok(lit(true)),
+            "false" | "FALSE" => Ok(lit(false)),
+            _ => match raw.parse::<i64>() {
+                Ok(value) => Ok(lit(value)),
+                Err(_) => raw
+                    .parse::<f64>()
+                    .map(lit)
+                    .map_err(|_| self.plan_error("Invalid graph mapping filter literal", raw)),
+            },
+        }
+    }
+
     /// Build a qualified node scan with property filters and column aliasing
     pub(crate) fn build_scan(
         &self,
@@ -38,6 +154,16 @@ impl DataFusionPlanner {
                     .map_err(|e| {
                         self.plan_error(&format!("Failed to scan node source '{}'", label), e)
                     })?;
+
+                if let Some(mapping) = self.config.get_node_mapping(label) {
+                    if let Some(filter) =
+                        self.mapping_filter(mapping.filter_conditions.as_deref())?
+                    {
+                        builder = builder.filter(filter).map_err(|error| {
+                            self.plan_error("Failed to apply graph node mapping filter", error)
+                        })?;
+                    }
+                }
 
                 // Combine property filters into single predicate for efficiency
                 if !properties.is_empty() {
@@ -136,6 +262,14 @@ impl DataFusionPlanner {
                 )
             })?;
 
+        if let Some(mapping) = self.config.get_relationship_mapping(&rel_instance.rel_type) {
+            if let Some(filter) = self.relationship_mapping_filter(mapping)? {
+                rel_builder = rel_builder.filter(filter).map_err(|error| {
+                    self.plan_error("Failed to apply graph relationship mapping filter", error)
+                })?;
+            }
+        }
+
         // Apply relationship property filters (e.g., -[r {since: 2020}]->)
         for (k, v) in relationship_properties.iter() {
             let lit_expr = super::expression::to_df_value_expr(
@@ -227,11 +361,19 @@ impl DataFusionPlanner {
 
         let rel_schema = rel_source.schema();
         let normalized_rel_type = rel_instance.rel_type.to_lowercase();
-        let rel_builder = LogicalPlanBuilder::scan(&normalized_rel_type, rel_source, None)
+        let mut rel_builder = LogicalPlanBuilder::scan(&normalized_rel_type, rel_source, None)
             .map_err(|e| crate::error::GraphError::PlanError {
                 message: format!("Failed to scan relationship: {}", e),
                 location: snafu::Location::new(file!(), line!(), column!()),
             })?;
+
+        if let Some(mapping) = self.config.get_relationship_mapping(&rel_instance.rel_type) {
+            if let Some(filter) = self.relationship_mapping_filter(mapping)? {
+                rel_builder = rel_builder.filter(filter).map_err(|error| {
+                    self.plan_error("Failed to apply graph relationship mapping filter", error)
+                })?;
+            }
+        }
 
         let rel_alias_lower = rel_instance.alias.to_lowercase();
         let rel_qualified_exprs: Vec<Expr> = rel_schema
@@ -280,6 +422,14 @@ impl DataFusionPlanner {
                     location: snafu::Location::new(file!(), line!(), column!()),
                 },
             )?;
+
+        if let Some(mapping) = self.config.get_node_mapping(target_label) {
+            if let Some(filter) = self.mapping_filter(mapping.filter_conditions.as_deref())? {
+                target_builder = target_builder.filter(filter).map_err(|error| {
+                    self.plan_error("Failed to apply graph node mapping filter", error)
+                })?;
+            }
+        }
 
         // Apply target property filters
         for (k, v) in target_properties.iter() {
