@@ -10,14 +10,25 @@ name = "_internal"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "56.2", features = ["pyarrow"] }
-arrow-array = "56.2"
-arrow-schema = "56.2"
-arrow-ipc = "56.2"
-datafusion = { version = "50.3", default-features = false }
+arrow = { version = "58.0", features = ["pyarrow"] }
+arrow-array = "58.0"
+arrow-schema = "58.0"
+arrow-ipc = "58.0"
+datafusion = { version = "54.0", default-features = false }
 futures = "0.3"
 lance-graph = { path = "../lance-graph" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39", "py-clone"] }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39", "py-clone"] }
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros"] }
+
+[features]
+hdfs = ["lance-graph/hdfs"]
+hdfs-jni = ["lance-graph/hdfs-jni"]
+qbfs = ["lance-graph/qbfs"]
+
+[patch.crates-io]
+hdfs-native = { path = "../../../lance/thirdparty/hdfs-native" }
+object_store_opendal = { path = "../../../lance/thirdparty/object_store_opendal-0.60.2" }
+opendal-service-hdfs-native = { path = "../../../lance/thirdparty/opendal-service-hdfs-native-0.59.2" }
+opendal-service-hdfs = { path = "../../../lance/thirdparty/opendal-service-hdfs-0.59.2" }

@@ -20,7 +20,7 @@ use crate::RT;
 
 // ---- Python wrapper for CatalogInfo ----
 
-#[pyclass(name = "CatalogInfo", module = "lance.graph")]
+#[pyclass(name = "CatalogInfo", module = "lance.graph", from_py_object)]
 #[derive(Clone)]
 pub struct PyCatalogInfo {
     inner: CatalogInfo,
@@ -45,7 +45,7 @@ impl PyCatalogInfo {
 
 // ---- Python wrapper for SchemaInfo ----
 
-#[pyclass(name = "SchemaInfo", module = "lance.graph")]
+#[pyclass(name = "SchemaInfo", module = "lance.graph", from_py_object)]
 #[derive(Clone)]
 pub struct PySchemaInfo {
     inner: SchemaInfo,
@@ -78,7 +78,7 @@ impl PySchemaInfo {
 
 // ---- Python wrapper for TableInfo ----
 
-#[pyclass(name = "TableInfo", module = "lance.graph")]
+#[pyclass(name = "TableInfo", module = "lance.graph", from_py_object)]
 #[derive(Clone)]
 pub struct PyTableInfo {
     inner: TableInfo,
@@ -250,9 +250,7 @@ impl PyUnityCatalog {
         let connector = self.connector.clone();
         let cat = catalog_name.to_string();
         let result = RT
-            .block_on(Some(py), async move {
-                connector.list_schemas(&cat).await
-            })?
+            .block_on(Some(py), async move { connector.list_schemas(&cat).await })?
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(result
             .into_iter()
@@ -278,9 +276,10 @@ impl PyUnityCatalog {
         let cat = catalog_name.to_string();
         let sch = schema_name.to_string();
         let result = RT
-            .block_on(Some(py), async move {
-                connector.list_tables(&cat, &sch).await
-            })?
+            .block_on(
+                Some(py),
+                async move { connector.list_tables(&cat, &sch).await },
+            )?
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(result
             .into_iter()
