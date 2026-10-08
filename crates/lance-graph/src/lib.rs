@@ -47,6 +47,7 @@ pub mod logical_plan;
 pub mod parameter_substitution;
 pub mod parser;
 pub mod query;
+mod runtime_id_filter;
 pub mod semantic;
 pub mod spark_dialect;
 pub mod sql_catalog;
@@ -71,6 +72,7 @@ pub use lance_graph_catalog::{
 pub use lance_graph_catalog::{UnityCatalogConfig, UnityCatalogProvider};
 pub use lance_vector_search::VectorSearch;
 pub use query::{CypherQuery, ExecutionStrategy, SqlDialect};
+pub use runtime_id_filter::RuntimeIdFilterMetrics;
 pub use sql_query::SqlQuery;
 #[cfg(feature = "delta")]
 pub use table_readers::DeltaTableReader;

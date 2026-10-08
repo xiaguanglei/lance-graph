@@ -94,6 +94,32 @@ let config = GraphConfig::builder()
 
 All queries use the DataFusion planner for optimization and execution.
 
+### Optional runtime node-ID filters
+
+`CypherQuery::with_runtime_id_filters(Arc<RuntimeIdFilterMetrics>)` opts in to
+consuming completed inner-JOIN membership filters on indexed Lance node scans.
+Node ID fields come from `GraphConfig`; only UTF-8 IDs with a snapshot-local
+BTree index participate. The original JOIN and all predicates remain in place.
+
+```rust,ignore
+use lance_graph::{CypherQuery, RuntimeIdFilterMetrics};
+use std::sync::Arc;
+
+let metrics = Arc::new(RuntimeIdFilterMetrics::default());
+let query = CypherQuery::new("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name")?
+    .with_config(config)
+    .with_runtime_id_filters(metrics.clone());
+let result = query.execute_with_context(ctx).await?;
+```
+
+The default is off. Static ID predicates retain the existing native index path.
+Non-Lance sources, relationship scans, unsupported producers/expressions,
+ordered or limited source scans, and membership above 150 IDs or 128 KiB keep
+the original scan. An incomplete producer has a shared 100 ms deadline per
+source before falling back to a fresh original scan; the wait remains inside
+the caller's query future and cancellation budget. Counters retain no IDs.
+This does not enable the CSR foundation or the Lance Native executor.
+
 A builder (`CypherQueryBuilder`) is also available for constructing queries programmatically without parsing text.
 
 ## Supported Cypher Surface

@@ -4707,6 +4707,7 @@ dependencies = [
  "lance",
  "lance-arrow",
  "lance-graph-catalog",
+ "lance-index",
  "lance-linalg",
  "lance-namespace",
  "nom 7.1.3",

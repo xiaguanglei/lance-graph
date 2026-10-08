@@ -33,11 +33,13 @@ futures = "0.3"
 lance-graph-catalog = { path = "../lance-graph-catalog", version = "0.5.4" }
 lance = { version = "13.0.0", path = "../../../lance/rust/lance", default-features = false }
 lance-linalg = { version = "13.0.0", path = "../../../lance/rust/lance-linalg" }
+lance-index = { version = "13.0.0", path = "../../../lance/rust/lance-index" }
 lance-namespace = { version = "13.0.0", path = "../../../lance/rust/lance-namespace" }
 nom = "7.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 snafu = "0.8"
+tokio = { version = "1.37", features = ["time"] }
 # The published Rust releases skip DataFusion 54; pin the official Python
 # 1.6.2 release's compatible Rust sources instead of mixing DF 50/53/55 types.
 deltalake = { git = "https://github.com/delta-io/delta-rs", rev = "dce52c6f10ee22753fec9aa1ff26e8f964175ef1", features = ["datafusion", "s3", "azure", "gcs"], optional = true }

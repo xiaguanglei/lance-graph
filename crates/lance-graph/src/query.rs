@@ -125,6 +125,8 @@ pub struct CypherQuery {
     config: Option<GraphConfig>,
     /// Query parameters
     parameters: HashMap<String, serde_json::Value>,
+    /// Optional completed JOIN membership consumer for indexed Lance nodes.
+    runtime_id_filter_metrics: Option<Arc<crate::RuntimeIdFilterMetrics>>,
 }
 impl CypherQuery {
     /// Create a new Cypher query from a query string
@@ -136,12 +138,28 @@ impl CypherQuery {
             ast,
             config: None,
             parameters: HashMap::new(),
+            runtime_id_filter_metrics: None,
         })
     }
 
     /// Set the graph configuration for this query
     pub fn with_config(mut self, config: GraphConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Opt in to bounded completed JOIN ID filters on UTF-8 Lance node IDs.
+    ///
+    /// Node ID fields come from GraphConfig. Only snapshot-local BTree indexed
+    /// nodes participate; other sources, relationship scans, static ID filters,
+    /// ordered/limited scans and unsupported runtime expressions stay unchanged.
+    /// The original JOIN is retained. An incomplete producer times out after
+    /// 100ms per source and falls back to a fresh original scan. This wait stays
+    /// inside the caller's existing query future and cancellation budget.
+    ///
+    /// The default is disabled. Counters are bounded, with no retained ID data.
+    pub fn with_runtime_id_filters(mut self, metrics: Arc<crate::RuntimeIdFilterMetrics>) -> Self {
+        self.runtime_id_filter_metrics = Some(metrics);
         self
     }
 
@@ -598,12 +616,11 @@ impl CypherQuery {
             // DataFusion represents FETCH as an i64 literal. A saturated
             // usize budget must not become a negative limit on 64-bit hosts.
             let fetch = max_rows.saturating_add(1).min(i64::MAX as usize);
-            df.limit(0, Some(fetch)).map_err(|e| {
-                GraphError::ExecutionError {
+            df.limit(0, Some(fetch))
+                .map_err(|e| GraphError::ExecutionError {
                     message: format!("Failed to apply result limit: {}", e),
                     location: snafu::Location::new(file!(), line!(), column!()),
-                }
-            })?
+                })?
         } else {
             df
         };
@@ -612,7 +629,21 @@ impl CypherQuery {
         let result_schema = df.schema().inner().clone();
 
         // Collect results
-        let batches = df.collect().await.map_err(|e| GraphError::ExecutionError {
+        let collected = if self.runtime_id_filter_metrics.is_some() {
+            // Physical producer identity is available only after post-phase
+            // pushdown. Bind then collect the same bounded logical DataFrame.
+            let task_context = Arc::new(df.task_ctx());
+            match df.create_physical_plan().await {
+                Ok(plan) => match crate::runtime_id_filter::bind_runtime_id_sources(plan) {
+                    Ok(plan) => datafusion::physical_plan::collect(plan, task_context).await,
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        } else {
+            df.collect().await
+        };
+        let batches = collected.map_err(|e| GraphError::ExecutionError {
             message: format!("Failed to collect query results: {}", e),
             location: snafu::Location::new(file!(), line!(), column!()),
         })?;
@@ -893,6 +924,15 @@ impl CypherQuery {
         let logical_plan = logical_planner.plan(&semantic.ast)?;
 
         // Phase 3: DataFusion Logical Plan
+        let catalog = if let Some(metrics) = &self.runtime_id_filter_metrics {
+            Arc::new(crate::runtime_id_filter::RuntimeIdSourceCatalog {
+                inner: catalog,
+                config: config.clone(),
+                metrics: metrics.clone(),
+            }) as Arc<dyn lance_graph_catalog::GraphSourceCatalog>
+        } else {
+            catalog
+        };
         let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
         let df_logical_plan = df_planner.plan(&logical_plan)?;
 
@@ -928,6 +968,16 @@ impl CypherQuery {
                     message: format!("Failed to create physical plan: {}", e),
                     location: snafu::Location::new(file!(), line!(), column!()),
                 })?;
+        let physical_plan = if self.runtime_id_filter_metrics.is_some() {
+            crate::runtime_id_filter::bind_runtime_id_sources(physical_plan).map_err(|e| {
+                GraphError::ExecutionError {
+                    message: format!("Failed to bind runtime ID producers: {e}"),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                }
+            })?
+        } else {
+            physical_plan
+        };
 
         Ok((logical_plan, df_logical_plan, physical_plan))
     }
@@ -1314,6 +1364,7 @@ impl CypherQueryBuilder {
             ast,
             config: self.config,
             parameters: self.parameters,
+            runtime_id_filter_metrics: None,
         };
 
         Ok(query)
