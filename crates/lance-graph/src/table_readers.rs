@@ -109,13 +109,23 @@ impl TableReader for DeltaTableReader {
             ))
         })?;
 
-        ctx.register_table(table_name, Arc::new(delta_table))
+        let provider = delta_table
+            .table_provider()
+            .with_session(Arc::new(ctx.state()))
+            .await
             .map_err(|e| {
                 CatalogError::Other(format!(
-                    "Failed to register Delta table '{}': {}",
+                    "Failed to create Delta table provider '{}': {}",
                     table_name, e
                 ))
             })?;
+
+        ctx.register_table(table_name, provider).map_err(|e| {
+            CatalogError::Other(format!(
+                "Failed to register Delta table '{}': {}",
+                table_name, e
+            ))
+        })?;
 
         Ok(())
     }
@@ -129,4 +139,99 @@ pub fn default_table_readers() -> Vec<Arc<dyn TableReader>> {
     #[cfg(feature = "delta")]
     readers.push(Arc::new(DeltaTableReader));
     readers
+}
+
+#[cfg(all(test, feature = "delta"))]
+mod tests {
+    use super::*;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_graph_catalog::catalog_provider::TableType;
+
+    fn table_info(location: Option<String>) -> TableInfo {
+        TableInfo {
+            name: "delta_nodes".into(),
+            catalog_name: "test".into(),
+            schema_name: "test".into(),
+            table_type: TableType::External,
+            data_source_format: DataSourceFormat::Delta,
+            columns: vec![],
+            storage_location: location,
+            comment: None,
+            properties: HashMap::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delta_reader_registers_local_table_and_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = url::Url::from_directory_path(dir.path()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        deltalake::DeltaTable::try_from_url(location.clone())
+            .await
+            .unwrap()
+            .write(vec![batch])
+            .await
+            .unwrap();
+
+        let ctx = SessionContext::new();
+        DeltaTableReader
+            .register_table(
+                &ctx,
+                "delta_nodes",
+                &table_info(Some(location.to_string())),
+                schema,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM delta_nodes WHERE id >= 2 ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_delta_reader_rejects_invalid_locations() {
+        for (location, expected) in [
+            (None, "has no storage_location"),
+            (Some("not-a-url".into()), "Invalid storage location URL"),
+        ] {
+            let err = DeltaTableReader
+                .register_table(
+                    &SessionContext::new(),
+                    "delta_nodes",
+                    &table_info(location),
+                    Arc::new(Schema::empty()),
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
 }

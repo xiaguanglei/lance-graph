@@ -7,3 +7,10 @@ members = [
 # Python package needs to be built by maturin.
 exclude = ["crates/lance-graph-python"]
 resolver = "2"
+
+# Cargo patches must be declared by each consuming workspace, not only Lance.
+[patch.crates-io]
+hdfs-native = { path = "../lance/thirdparty/hdfs-native" }
+object_store_opendal = { path = "../lance/thirdparty/object_store_opendal-0.60.2" }
+opendal-service-hdfs-native = { path = "../lance/thirdparty/opendal-service-hdfs-native-0.59.2" }
+opendal-service-hdfs = { path = "../lance/thirdparty/opendal-service-hdfs-0.59.2" }
