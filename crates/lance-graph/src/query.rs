@@ -335,6 +335,16 @@ impl CypherQuery {
         self.explain_internal(Arc::new(catalog), ctx).await
     }
 
+    /// Explain using the actual table providers used by graph execution.
+    /// The batch-based `explain` API only plans over in-memory schema batches.
+    pub async fn explain_with_context(
+        &self,
+        ctx: datafusion::execution::context::SessionContext,
+    ) -> Result<String> {
+        let catalog = self.catalog_from_context(&ctx).await?;
+        self.explain_internal(catalog, ctx).await
+    }
+
     /// Convert the Cypher query to a SQL string in the specified dialect.
     ///
     /// This method generates a SQL string that corresponds to the DataFusion logical plan
@@ -447,16 +457,35 @@ impl CypherQuery {
         &self,
         ctx: datafusion::execution::context::SessionContext,
     ) -> Result<arrow::record_batch::RecordBatch> {
+        let catalog = self.catalog_from_context(&ctx).await?;
+        self.execute_with_catalog_and_context(catalog, ctx).await
+    }
+
+    /// Execute against a context while collecting at most `max_rows + 1` rows.
+    ///
+    /// The extra row lets an HTTP caller reject an oversized result explicitly
+    /// rather than silently truncating it, without first materializing the
+    /// entire result set.
+    pub async fn execute_with_context_limited(
+        &self,
+        ctx: datafusion::execution::context::SessionContext,
+        max_rows: usize,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        let catalog = self.catalog_from_context(&ctx).await?;
+        self.execute_with_catalog_and_context_limited(catalog, ctx, max_rows)
+            .await
+    }
+
+    async fn catalog_from_context(
+        &self,
+        ctx: &datafusion::execution::context::SessionContext,
+    ) -> Result<std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>> {
         use datafusion::datasource::DefaultTableSource;
         use lance_graph_catalog::InMemoryCatalog;
         use std::sync::Arc;
 
         let config = self.require_config()?;
-
-        // Build catalog by querying SessionContext for table providers
         let mut catalog = InMemoryCatalog::new();
-
-        // Register node sources
         for label in config.node_mappings.keys() {
             let table_provider =
                 ctx.table_provider(label)
@@ -468,12 +497,9 @@ impl CypherQuery {
                         ),
                         location: snafu::Location::new(file!(), line!(), column!()),
                     })?;
-
-            let table_source = Arc::new(DefaultTableSource::new(table_provider));
-            catalog = catalog.with_node_source(label, table_source);
+            catalog =
+                catalog.with_node_source(label, Arc::new(DefaultTableSource::new(table_provider)));
         }
-
-        // Register relationship sources
         for rel_type in config.relationship_mappings.keys() {
             let table_provider =
                 ctx.table_provider(rel_type)
@@ -485,14 +511,12 @@ impl CypherQuery {
                         ),
                         location: snafu::Location::new(file!(), line!(), column!()),
                     })?;
-
-            let table_source = Arc::new(DefaultTableSource::new(table_provider));
-            catalog = catalog.with_relationship_source(rel_type, table_source);
+            catalog = catalog.with_relationship_source(
+                rel_type,
+                Arc::new(DefaultTableSource::new(table_provider)),
+            );
         }
-
-        // Execute using the built catalog
-        self.execute_with_catalog_and_context(Arc::new(catalog), ctx)
-            .await
+        Ok(Arc::new(catalog))
     }
 
     /// Execute query with an explicit catalog and session context
@@ -536,6 +560,27 @@ impl CypherQuery {
         catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         ctx: datafusion::execution::context::SessionContext,
     ) -> Result<arrow::record_batch::RecordBatch> {
+        self.execute_with_catalog_and_context_inner(catalog, ctx, None)
+            .await
+    }
+
+    /// The bounded variant of [`Self::execute_with_catalog_and_context`].
+    pub async fn execute_with_catalog_and_context_limited(
+        &self,
+        catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
+        ctx: datafusion::execution::context::SessionContext,
+        max_rows: usize,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        self.execute_with_catalog_and_context_inner(catalog, ctx, Some(max_rows))
+            .await
+    }
+
+    async fn execute_with_catalog_and_context_inner(
+        &self,
+        catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
+        ctx: datafusion::execution::context::SessionContext,
+        max_rows: Option<usize>,
+    ) -> Result<arrow::record_batch::RecordBatch> {
         use arrow::compute::concat_batches;
 
         // Create logical plans (phases 1-3)
@@ -549,6 +594,19 @@ impl CypherQuery {
                 message: format!("Failed to execute DataFusion plan: {}", e),
                 location: snafu::Location::new(file!(), line!(), column!()),
             })?;
+        let df = if let Some(max_rows) = max_rows {
+            // DataFusion represents FETCH as an i64 literal. A saturated
+            // usize budget must not become a negative limit on 64-bit hosts.
+            let fetch = max_rows.saturating_add(1).min(i64::MAX as usize);
+            df.limit(0, Some(fetch)).map_err(|e| {
+                GraphError::ExecutionError {
+                    message: format!("Failed to apply result limit: {}", e),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                }
+            })?
+        } else {
+            df
+        };
 
         // Get schema before collecting (in case result is empty)
         let result_schema = df.schema().inner().clone();
