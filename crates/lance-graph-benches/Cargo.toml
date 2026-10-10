@@ -18,3 +18,7 @@ tokio = { version = "1.37", features = ["macros", "rt-multi-thread"] }
 [[bench]]
 name = "graph_execution"
 harness = false
+
+[[bench]]
+name = "csr_adjacency"
+harness = false
