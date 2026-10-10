@@ -838,12 +838,9 @@ impl lance_graph_catalog::GraphSourceCatalog for RuntimeIdSourceCatalog {
     }
 }
 
-/// Validate producer provenance on the final optimized physical tree, after
-/// DataFusion's post-phase has remapped expression children. Unknown/TopK,
-/// anti/mark/outer joins and NULL-equal joins are deliberately not supported.
-pub(crate) fn bind_runtime_id_sources(
-    plan: Arc<dyn ExecutionPlan>,
-) -> Result<Arc<dyn ExecutionPlan>> {
+/// Provenance shared by optional node-index and relationship-adjacency consumers.
+/// Only completed filters from null-rejecting inner hash joins may narrow rows.
+pub(crate) fn completed_inner_join_filter_ids(plan: &Arc<dyn ExecutionPlan>) -> BTreeSet<u64> {
     use datafusion::{
         common::NullEquality,
         logical_expr::JoinType,
@@ -864,6 +861,17 @@ pub(crate) fn bind_runtime_id_sources(
             collect(child, allowed);
         }
     }
+    let mut allowed = BTreeSet::new();
+    collect(plan, &mut allowed);
+    allowed
+}
+
+/// Validate producer provenance on the final optimized physical tree, after
+/// DataFusion's post-phase has remapped expression children. Unknown/TopK,
+/// anti/mark/outer joins and NULL-equal joins are deliberately not supported.
+pub(crate) fn bind_runtime_id_sources(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
     fn bind(
         plan: Arc<dyn ExecutionPlan>,
         allowed: &BTreeSet<u64>,
@@ -888,7 +896,6 @@ pub(crate) fn bind_runtime_id_sources(
             .collect::<Result<Vec<_>>>()?;
         datafusion::physical_plan::with_new_children_if_necessary(plan, children)
     }
-    let mut allowed = BTreeSet::new();
-    collect(&plan, &mut allowed);
+    let allowed = completed_inner_join_filter_ids(&plan);
     bind(plan, &allowed)
 }

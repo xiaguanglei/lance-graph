@@ -127,6 +127,10 @@ pub struct CypherQuery {
     parameters: HashMap<String, serde_json::Value>,
     /// Optional completed JOIN membership consumer for indexed Lance nodes.
     runtime_id_filter_metrics: Option<Arc<crate::RuntimeIdFilterMetrics>>,
+    /// Snapshot-local adjacency candidates; original Cypher filters and JOINs remain.
+    csr_adjacency_enabled: bool,
+    csr_adjacency_cache: Arc<crate::CsrAdjacencyCache>,
+    csr_adjacency_metrics: Arc<crate::CsrScanMetrics>,
 }
 impl CypherQuery {
     /// Create a new Cypher query from a query string
@@ -139,6 +143,9 @@ impl CypherQuery {
             config: None,
             parameters: HashMap::new(),
             runtime_id_filter_metrics: None,
+            csr_adjacency_enabled: true,
+            csr_adjacency_cache: Arc::new(crate::CsrAdjacencyCache::default()),
+            csr_adjacency_metrics: Arc::new(crate::CsrScanMetrics::default()),
         })
     }
 
@@ -146,6 +153,49 @@ impl CypherQuery {
     pub fn with_config(mut self, config: GraphConfig) -> Self {
         self.config = Some(config);
         self
+    }
+
+    /// Enable or disable bounded CSR adjacency scans in the DataFusion executor.
+    ///
+    /// Enabled by default for Lance relationship endpoints bound statically or
+    /// by a completed, proven null-rejecting inner JOIN. Existing endpoint BTree
+    /// indexes are preferred over building adjacency. Unsupported predicates,
+    /// sources, producers and exhausted budgets keep the original scan.
+    /// Original JOINs and residual filters preserve Cypher multiplicity,
+    /// relationship properties and caller visibility rules.
+    pub fn with_csr_adjacency(mut self, enabled: bool) -> Self {
+        self.csr_adjacency_enabled = enabled;
+        self
+    }
+
+    /// Reuse adjacency across queries in the same caller's storage context.
+    ///
+    /// Entries are pinned to dataset, manifest, session and object-store identity;
+    /// a new snapshot never consumes stale adjacency. This is an explicit bounded
+    /// cache, not a global cache of query results or ACL decisions. Without this
+    /// method the cache lives with this query (and its clones) only.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_graph::{CsrAdjacencyCache, CypherQuery};
+    /// # fn example() -> lance_graph::Result<()> {
+    /// let cache = Arc::new(CsrAdjacencyCache::default());
+    /// let query = CypherQuery::new(
+    ///     "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE a.person_id = 'p1' RETURN b.person_id"
+    /// )?.with_shared_csr_cache(cache.clone());
+    /// // Reuse `cache` with queries over the same pinned source catalog.
+    /// # let _ = query;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_shared_csr_cache(mut self, cache: Arc<crate::CsrAdjacencyCache>) -> Self {
+        self.csr_adjacency_cache = cache;
+        self
+    }
+
+    /// Execution counters distinguish actual CSR reads from planned/fallback scans.
+    pub fn csr_adjacency_metrics(&self) -> Arc<crate::CsrScanMetrics> {
+        self.csr_adjacency_metrics.clone()
     }
 
     /// Opt in to bounded completed JOIN ID filters on UTF-8 Lance node IDs.
@@ -629,12 +679,12 @@ impl CypherQuery {
         let result_schema = df.schema().inner().clone();
 
         // Collect results
-        let collected = if self.runtime_id_filter_metrics.is_some() {
+        let collected = if self.runtime_id_filter_metrics.is_some() || self.csr_adjacency_enabled {
             // Physical producer identity is available only after post-phase
             // pushdown. Bind then collect the same bounded logical DataFrame.
             let task_context = Arc::new(df.task_ctx());
             match df.create_physical_plan().await {
-                Ok(plan) => match crate::runtime_id_filter::bind_runtime_id_sources(plan) {
+                Ok(plan) => match self.bind_runtime_sources(plan) {
                     Ok(plan) => datafusion::physical_plan::collect(plan, task_context).await,
                     Err(error) => Err(error),
                 },
@@ -924,6 +974,16 @@ impl CypherQuery {
         let logical_plan = logical_planner.plan(&semantic.ast)?;
 
         // Phase 3: DataFusion Logical Plan
+        let catalog = if self.csr_adjacency_enabled {
+            Arc::new(crate::csr_provider::CsrSourceCatalog::new(
+                catalog,
+                config.clone(),
+                self.csr_adjacency_cache.clone(),
+                self.csr_adjacency_metrics.clone(),
+            )) as Arc<dyn lance_graph_catalog::GraphSourceCatalog>
+        } else {
+            catalog
+        };
         let catalog = if let Some(metrics) = &self.runtime_id_filter_metrics {
             Arc::new(crate::runtime_id_filter::RuntimeIdSourceCatalog {
                 inner: catalog,
@@ -937,6 +997,22 @@ impl CypherQuery {
         let df_logical_plan = df_planner.plan(&logical_plan)?;
 
         Ok((logical_plan, df_logical_plan))
+    }
+
+    /// Bind optional consumers only after the final optimizer has identified
+    /// their actual null-rejecting inner-JOIN producers. A source cannot certify
+    /// its own dynamic filter merely because an expression reached its callback.
+    fn bind_runtime_sources(
+        &self,
+        mut plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        if self.runtime_id_filter_metrics.is_some() {
+            plan = crate::runtime_id_filter::bind_runtime_id_sources(plan)?;
+        }
+        if self.csr_adjacency_enabled {
+            plan = crate::csr_provider::bind_csr_runtime_sources(plan)?;
+        }
+        Ok(plan)
     }
 
     /// Helper to create all plans (graph logical, DataFusion logical, physical)
@@ -968,16 +1044,12 @@ impl CypherQuery {
                     message: format!("Failed to create physical plan: {}", e),
                     location: snafu::Location::new(file!(), line!(), column!()),
                 })?;
-        let physical_plan = if self.runtime_id_filter_metrics.is_some() {
-            crate::runtime_id_filter::bind_runtime_id_sources(physical_plan).map_err(|e| {
-                GraphError::ExecutionError {
-                    message: format!("Failed to bind runtime ID producers: {e}"),
+        let physical_plan =
+            self.bind_runtime_sources(physical_plan)
+                .map_err(|e| GraphError::ExecutionError {
+                    message: format!("Failed to bind runtime source producers: {e}"),
                     location: snafu::Location::new(file!(), line!(), column!()),
-                }
-            })?
-        } else {
-            physical_plan
-        };
+                })?;
 
         Ok((logical_plan, df_logical_plan, physical_plan))
     }
@@ -1365,6 +1437,9 @@ impl CypherQueryBuilder {
             config: self.config,
             parameters: self.parameters,
             runtime_id_filter_metrics: None,
+            csr_adjacency_enabled: true,
+            csr_adjacency_cache: Arc::new(crate::CsrAdjacencyCache::default()),
+            csr_adjacency_metrics: Arc::new(crate::CsrScanMetrics::default()),
         };
 
         Ok(query)
@@ -1375,6 +1450,27 @@ impl CypherQueryBuilder {
 mod tests {
     use super::*;
     use crate::config::GraphConfig;
+
+    #[test]
+    fn test_default_executor_adjacency_options() {
+        let query = CypherQuery::new("MATCH (n:Person) RETURN n.name").unwrap();
+        assert!(query.csr_adjacency_enabled);
+        let cloned = query.clone();
+        assert!(Arc::ptr_eq(
+            &query.csr_adjacency_cache,
+            &cloned.csr_adjacency_cache
+        ));
+        assert!(Arc::ptr_eq(
+            &query.csr_adjacency_metrics(),
+            &cloned.csr_adjacency_metrics()
+        ));
+        let cache = Arc::new(crate::CsrAdjacencyCache::default());
+        let query = query
+            .with_csr_adjacency(false)
+            .with_shared_csr_cache(cache.clone());
+        assert!(!query.csr_adjacency_enabled);
+        assert!(Arc::ptr_eq(&query.csr_adjacency_cache, &cache));
+    }
 
     #[test]
     fn test_parse_simple_cypher_query() {
