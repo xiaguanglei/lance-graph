@@ -4726,9 +4726,12 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "criterion",
+ "datafusion",
  "futures",
  "lance",
  "lance-graph",
+ "lance-index",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
