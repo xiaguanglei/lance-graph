@@ -32,6 +32,18 @@ impl DataFusionPlanner {
         ctx: &mut PlanningContext,
         op: &LogicalOperator,
     ) -> Result<LogicalPlan> {
+        if self.native_multihop.is_some() {
+            if let Some(source) = crate::csr_multihop::try_source(self, ctx, op)? {
+                return datafusion::logical_expr::LogicalPlanBuilder::scan(
+                    "__native_csr_multihop",
+                    source,
+                    None,
+                )
+                .map_err(|error| self.plan_error("Failed to plan native CSR multi-hop", error))?
+                .build()
+                .map_err(|error| self.plan_error("Failed to build native CSR multi-hop", error));
+            }
+        }
         match op {
             LogicalOperator::ScanByLabel {
                 variable,

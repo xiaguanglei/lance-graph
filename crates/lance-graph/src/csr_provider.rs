@@ -108,6 +108,19 @@ pub struct CsrScanMetrics {
     pub unsupported_runtime_fallbacks: AtomicU64,
     pub runtime_planning_fallbacks: AtomicU64,
     pub rejected_producer_filters: AtomicU64,
+    pub native_multihop_planned: AtomicU64,
+    pub native_multihop_executions: AtomicU64,
+    pub native_multihop_rows: AtomicU64,
+    pub native_multihop_edge_checks: AtomicU64,
+    pub native_multihop_fallbacks: AtomicU64,
+    /// Projected input consumed while preparing native per-query masks,
+    /// including guarded attempts that later fall back. Bytes are Arrow array
+    /// memory estimates, not process RSS or storage/network bytes.
+    pub native_multihop_input_rows: AtomicU64,
+    pub native_multihop_input_bytes: AtomicU64,
+    /// Completed node reads whose executed plan contains a BTree lookup on an
+    /// actual node-ID field, rather than merely an index on an ACL property.
+    pub native_multihop_node_index_reads: AtomicU64,
 }
 
 /// Share only within one caller's security context. Entries retain the exact
@@ -148,17 +161,20 @@ struct CacheEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum Endpoint {
+pub(crate) enum Endpoint {
     Text(String),
     Number(u64),
 }
 
 #[derive(Debug)]
-struct AdjacencySnapshot {
+pub(crate) struct AdjacencySnapshot {
     _dataset: Arc<Dataset>,
-    outgoing: CsrIndex,
-    incoming: CsrIndex,
-    vertices: HashMap<Endpoint, u64>,
+    pub(crate) outgoing: CsrIndex,
+    pub(crate) incoming: CsrIndex,
+    pub(crate) vertices: HashMap<Endpoint, u64>,
+    /// Reverse identity belongs to the same pinned topology. Preparing it once
+    /// avoids an O(all vertices) HashMap walk on every bounded path query.
+    pub(crate) endpoints: Vec<Endpoint>,
     rows: usize,
     bytes: usize,
 }
@@ -177,7 +193,11 @@ impl CsrAdjacencyCache {
         }
     }
 
-    async fn snapshot(
+    pub(crate) fn options(&self) -> &CsrScanOptions {
+        &self.options
+    }
+
+    pub(crate) async fn snapshot(
         &self,
         dataset: Arc<Dataset>,
         source: &str,
@@ -234,7 +254,7 @@ impl CsrAdjacencyCache {
     }
 }
 
-fn array_endpoint(array: &dyn Array, row: usize) -> Option<Endpoint> {
+pub(crate) fn array_endpoint(array: &dyn Array, row: usize) -> Option<Endpoint> {
     if array.is_null(row) {
         return None;
     }
@@ -332,10 +352,26 @@ async fn build_snapshot(
     if rows != expected_rows {
         return None;
     }
-    let bytes = edge_bytes
+    let base_bytes = edge_bytes
         .checked_add(vertices.len().checked_mul(192)?)?
         .checked_add(text_bytes.checked_mul(2)?)?
         .checked_add(max_batch_bytes)?;
+    // One exact-size reverse vector plus cloned strings is allocated only
+    // after its construction/retained estimate fits the same cache budget.
+    // The existing builder estimate remains conservative rather than being
+    // silently reduced to make a larger topology pass.
+    let reverse_bytes = vertices
+        .len()
+        .checked_mul(std::mem::size_of::<Endpoint>())?
+        .checked_add(text_bytes)?;
+    let bytes = base_bytes.checked_add(reverse_bytes)?;
+    if bytes > budget {
+        return None;
+    }
+    let mut endpoints = vec![Endpoint::Number(0); vertices.len()];
+    for (key, id) in &vertices {
+        *endpoints.get_mut(*id as usize)? = key.clone();
+    }
     Some(Arc::new(AdjacencySnapshot {
         _dataset: dataset,
         outgoing: outgoing
@@ -347,6 +383,7 @@ async fn build_snapshot(
             .try_build()
             .ok()?,
         vertices,
+        endpoints,
         rows,
         bytes,
     }))
@@ -367,7 +404,7 @@ fn scalar_endpoint(value: &ScalarValue, datatype: &DataType) -> Option<Endpoint>
 // both branches independently constrain this same field: union their necessary
 // supersets, retaining every original residual. Never guess a missing branch's
 // bounds (cross-field OR, NOT, casts or NULL).
-fn bound_keys(
+pub(crate) fn bound_keys(
     expr: &Expr,
     field: &str,
     datatype: &DataType,
@@ -710,7 +747,7 @@ fn endpoint_predicate(name: &str, keys: &BTreeSet<Endpoint>) -> Expr {
     )
 }
 
-fn endpoint_btree_plan(plan: &Arc<dyn ExecutionPlan>, names: &BTreeSet<String>) -> bool {
+pub(crate) fn endpoint_btree_plan(plan: &Arc<dyn ExecutionPlan>, names: &BTreeSet<String>) -> bool {
     fn expression(expr: &ScalarIndexExpr, names: &BTreeSet<String>) -> bool {
         match expr {
             ScalarIndexExpr::Query(query) => {
@@ -809,6 +846,16 @@ struct CsrRelationshipProvider {
     target: String,
     cache: Arc<CsrAdjacencyCache>,
     metrics: Arc<CsrScanMetrics>,
+}
+
+pub(crate) fn underlying_lance(
+    provider: &Arc<dyn TableProvider>,
+) -> Option<Arc<LanceTableProvider>> {
+    if let Some(csr) = provider.downcast_ref::<CsrRelationshipProvider>() {
+        return Some(csr.inner.clone());
+    }
+    let any: Arc<dyn std::any::Any + Send + Sync> = provider.clone();
+    Arc::downcast::<LanceTableProvider>(any).ok()
 }
 
 #[async_trait]
@@ -1540,6 +1587,44 @@ mod tests {
                 metrics: Arc::new(CsrScanMetrics::default()),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn reverse_identity_matches_dense_mapping_and_fits_the_same_budget() {
+        let (_temp, provider) = fixture(false, CsrScanOptions::default()).await;
+        let snapshot = provider
+            .cache
+            .snapshot(provider.inner.dataset(), "src", "dst", &provider.metrics)
+            .await
+            .unwrap();
+        let text_bytes = snapshot
+            .vertices
+            .keys()
+            .map(|key| match key {
+                Endpoint::Text(value) => value.len(),
+                Endpoint::Number(_) => 0,
+            })
+            .sum::<usize>();
+        for (key, id) in &snapshot.vertices {
+            assert_eq!(&snapshot.endpoints[*id as usize], key);
+        }
+        let reverse_bytes = snapshot.vertices.len() * std::mem::size_of::<Endpoint>() + text_bytes;
+        assert!(reverse_bytes > 0 && snapshot.bytes > reverse_bytes);
+        let previous_base_budget = snapshot.bytes - reverse_bytes;
+        let cache = CsrAdjacencyCache::new(CsrScanOptions {
+            max_bytes: previous_base_budget,
+            max_cache_bytes: previous_base_budget,
+            ..Default::default()
+        });
+        assert!(cache
+            .snapshot(
+                provider.inner.dataset(),
+                "src",
+                "dst",
+                &CsrScanMetrics::default()
+            )
+            .await
+            .is_none());
     }
 
     #[tokio::test]

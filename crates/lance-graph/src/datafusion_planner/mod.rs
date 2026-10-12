@@ -17,7 +17,7 @@
 pub mod analysis;
 mod builder;
 mod config_helpers;
-mod expression;
+pub(crate) mod expression;
 mod join_ops;
 mod scan_ops;
 mod udf;
@@ -45,6 +45,7 @@ pub trait GraphPhysicalPlanner {
 pub struct DataFusionPlanner {
     pub(crate) config: GraphConfig,
     pub(crate) catalog: Option<Arc<dyn GraphSourceCatalog>>,
+    pub(crate) native_multihop: Option<crate::csr_multihop::NativeMultihopOptions>,
 }
 
 impl DataFusionPlanner {
@@ -52,6 +53,7 @@ impl DataFusionPlanner {
         Self {
             config,
             catalog: None,
+            native_multihop: None,
         }
     }
 
@@ -59,6 +61,7 @@ impl DataFusionPlanner {
         Self {
             config,
             catalog: Some(catalog),
+            native_multihop: None,
         }
     }
 

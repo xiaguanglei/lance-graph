@@ -129,6 +129,7 @@ pub struct CypherQuery {
     runtime_id_filter_metrics: Option<Arc<crate::RuntimeIdFilterMetrics>>,
     /// Snapshot-local adjacency candidates; original Cypher filters and JOINs remain.
     csr_adjacency_enabled: bool,
+    csr_native_multihop_enabled: bool,
     csr_adjacency_cache: Arc<crate::CsrAdjacencyCache>,
     csr_adjacency_metrics: Arc<crate::CsrScanMetrics>,
 }
@@ -144,6 +145,7 @@ impl CypherQuery {
             parameters: HashMap::new(),
             runtime_id_filter_metrics: None,
             csr_adjacency_enabled: true,
+            csr_native_multihop_enabled: true,
             csr_adjacency_cache: Arc::new(crate::CsrAdjacencyCache::default()),
             csr_adjacency_metrics: Arc::new(crate::CsrScanMetrics::default()),
         })
@@ -166,6 +168,22 @@ impl CypherQuery {
     pub fn with_csr_adjacency(mut self, enabled: bool) -> Self {
         self.csr_adjacency_enabled = enabled;
         self
+    }
+
+    /// Disable only native multi-hop when comparing against the unchanged
+    /// single-hop CSR/JOIN executor. Other adjacency and version rules remain.
+    pub fn with_native_multihop(mut self, enabled: bool) -> Self {
+        self.csr_native_multihop_enabled = enabled;
+        self
+    }
+
+    /// Cheap AST-shape hint for choosing replayable table providers: one fixed
+    /// two- or three-hop MATCH without WITH. This does not validate storage,
+    /// bindings, predicates, indexes, budgets or actual native execution, and
+    /// is intentionally independent of execution flags and parameter values.
+    /// Use `csr_adjacency_metrics()` after execution to prove consumption.
+    pub fn native_multihop_candidate(&self) -> bool {
+        crate::csr_multihop::supports_query(&self.ast)
     }
 
     /// Reuse adjacency across queries in the same caller's storage context.
@@ -993,7 +1011,19 @@ impl CypherQuery {
         } else {
             catalog
         };
-        let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
+        let mut df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
+        if self.csr_adjacency_enabled
+            && self.csr_native_multihop_enabled
+            && crate::csr_multihop::supports_query(&semantic.ast)
+        {
+            df_planner.native_multihop = Some(crate::csr_multihop::NativeMultihopOptions {
+                cache: self.csr_adjacency_cache.clone(),
+                metrics: self.csr_adjacency_metrics.clone(),
+                predicate: semantic.ast.where_clause.as_ref().map(|clause| {
+                    crate::datafusion_planner::expression::to_df_boolean_expr(&clause.expression)
+                }),
+            });
+        }
         let df_logical_plan = df_planner.plan(&logical_plan)?;
 
         Ok((logical_plan, df_logical_plan))
@@ -1438,6 +1468,7 @@ impl CypherQueryBuilder {
             parameters: self.parameters,
             runtime_id_filter_metrics: None,
             csr_adjacency_enabled: true,
+            csr_native_multihop_enabled: true,
             csr_adjacency_cache: Arc::new(crate::CsrAdjacencyCache::default()),
             csr_adjacency_metrics: Arc::new(crate::CsrScanMetrics::default()),
         };

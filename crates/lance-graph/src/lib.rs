@@ -39,7 +39,9 @@ pub mod ast;
 pub mod case_insensitive;
 pub mod config;
 pub mod csr_index;
+mod csr_multihop;
 mod csr_provider;
+pub mod csr_walk;
 pub mod datafusion_planner;
 pub mod error;
 pub mod lance_native_planner;
@@ -63,6 +65,9 @@ pub use csr_index::{
     build_bidirectional_index, try_build_bidirectional_index_with_ids, CsrIndex, CsrIndexBuilder,
 };
 pub use csr_provider::{CsrAdjacencyCache, CsrScanMetrics, CsrScanOptions};
+pub use csr_walk::{
+    csr_walk_filtered, csr_walk_steps_filtered, CsrWalk, CsrWalkOptions, CsrWalkResult,
+};
 pub use error::{GraphError, Result};
 pub use lance_graph_catalog::{
     DirNamespace, GraphSourceCatalog, InMemoryCatalog, SimpleTableSource,
