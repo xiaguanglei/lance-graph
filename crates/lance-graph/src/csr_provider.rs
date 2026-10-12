@@ -916,6 +916,25 @@ impl TableProvider for CsrRelationshipProvider {
             return self.inner.scan(state, projection, filters, limit).await;
         };
         self.metrics.planned_scans.fetch_add(1, Ordering::Relaxed);
+        // Do not erase the known manifest cardinality merely because the
+        // optional source can later use adjacency. Unknown relationship stats
+        // can make DataFusion put a large indexed node source on the build
+        // side, where completed JOIN membership cannot narrow its read.
+        // This is metadata-only; legacy/partial manifests remain unknown.
+        let mut statistics = Statistics::new_unknown(&input_schema);
+        let dataset = self.inner.dataset();
+        if dataset.manifest().writer_version.is_some() {
+            if let Some(rows) = dataset
+                .manifest()
+                .fragments
+                .iter()
+                .try_fold(0usize, |rows, fragment| {
+                    rows.checked_add(fragment.num_rows()?)
+                })
+            {
+                statistics.num_rows = datafusion::common::stats::Precision::Exact(rows);
+            }
+        }
         let plan: Arc<dyn ExecutionPlan> = Arc::new(CsrScanExec {
             // Do not plan the native scanner on a successful CSR path. Nor may
             // endpoint candidates advertise filter-derived constants/order to
@@ -939,6 +958,7 @@ impl TableProvider for CsrRelationshipProvider {
             runtime_filters: Vec::new(),
             validated_runtime: false,
             wait: Duration::from_millis(100),
+            statistics: Arc::new(statistics),
         });
         // Compilation/schema errors are handled before reading data. Genuine
         // filtering/take execution errors propagate and are never replayed.
@@ -965,6 +985,7 @@ struct CsrScanExec {
     runtime_filters: Vec<RuntimeEndpointFilter>,
     validated_runtime: bool,
     wait: Duration,
+    statistics: Arc<Statistics>,
 }
 
 struct RuntimeBounds {
@@ -1076,7 +1097,18 @@ impl ExecutionPlan for CsrScanExec {
         Ok(Arc::new(reset))
     }
     fn partition_statistics(&self, _: Option<usize>) -> Result<Arc<Statistics>> {
-        Ok(Arc::new(Statistics::new_unknown(self.schema().as_ref())))
+        if !self.filters.is_empty()
+            || self.sources.is_some()
+            || self.targets.is_some()
+            || !self.runtime_filters.is_empty()
+        {
+            // A candidate subset need not have the raw snapshot cardinality.
+            // Retain its estimate for join costing, never certify an exact
+            // count through static/runtime adjacency narrowing.
+            Ok(Arc::new(self.statistics.as_ref().clone().to_inexact()))
+        } else {
+            Ok(self.statistics.clone())
+        }
     }
     fn handle_child_pushdown_result(
         &self,
@@ -1875,6 +1907,59 @@ mod tests {
             )
             .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_cardinality_keeps_join_costs_but_not_exact_prefilter_counts() {
+        use datafusion::common::stats::Precision;
+        let (_temp, provider) = fixture(false, CsrScanOptions::default()).await;
+        let ctx = SessionContext::new();
+        let plain = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let source = plain.downcast_ref::<CsrScanExec>().unwrap();
+        assert_eq!(
+            source.partition_statistics(None).unwrap().num_rows,
+            Precision::Exact(4)
+        );
+        // Statistics come from the pinned manifest, not a native scan/CSR build.
+        assert_eq!(provider.metrics.build_count.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.metrics.take_rows.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            source.partition_statistics(None).unwrap().total_byte_size,
+            Precision::Absent
+        );
+        let filtered = provider
+            .scan(&ctx.state(), None, &[col("src").eq(lit("a"))], None)
+            .await
+            .unwrap();
+        let filtered = filtered.downcast_ref::<FilterExec>().unwrap();
+        let filtered = filtered.input().downcast_ref::<CsrScanExec>().unwrap();
+        assert_eq!(
+            filtered.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(4)
+        );
+        let property = provider
+            .scan(&ctx.state(), None, &[col("weight").gt_eq(lit(2u64))], None)
+            .await
+            .unwrap();
+        let property = property.downcast_ref::<FilterExec>().unwrap();
+        let property = property.input().downcast_ref::<CsrScanExec>().unwrap();
+        assert!(property.sources.is_none() && property.targets.is_none());
+        assert_eq!(
+            property.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(4)
+        );
+        let mut runtime = source.clone();
+        runtime.runtime_filters.push(RuntimeEndpointFilter {
+            dynamic: Arc::new(DynamicFilterPhysicalExpr::new(
+                vec![Arc::new(Column::new("src", 0))],
+                physical_keys("src", 0, vec![Some("a")]),
+            )),
+            source: true,
+        });
+        assert_eq!(
+            runtime.partition_statistics(None).unwrap().num_rows,
+            Precision::Inexact(4)
+        );
     }
 
     #[tokio::test]
