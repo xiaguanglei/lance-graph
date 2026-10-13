@@ -120,6 +120,43 @@ source before falling back to a fresh original scan; the wait remains inside
 the caller's query future and cancellation budget. Counters retain no IDs.
 This does not enable the CSR foundation or the Lance Native executor.
 
+### CSR adjacency cache and native paths
+
+Seeded fixed paths of one to three hops over Lance tables
+(`MATCH (a:Entity {id:'x'})-[:REL]->(b) ...`, `WHERE a.id IN [...]`) run as a
+single CSR traversal instead of per-hop JOINs; every other shape, and any path
+whose topology does not fit the limits, plans the ordinary JOINs. Results are
+identical either way. Share one cache per caller security context so snapshots
+are reused across queries:
+
+```rust,ignore
+use lance_graph::{CsrAdjacencyCache, CsrScanOptions, CypherQuery};
+use std::sync::Arc;
+
+let cache = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+    max_edges: 5_000_000,                    // largest edge table to index
+    max_bytes: 512 << 20,                    // one cold build: ~64 B/edge
+    max_cache_bytes: 1 << 30,                // all cached versions: ~32 B/edge
+    max_cache_rows: 10_000_000,
+    ..Default::default()
+}));
+// After a write, optionally prepare the new version before queries need it.
+cache.warm_adjacency(edges_dataset.clone(), "source_id", "target_id").await;
+let query = CypherQuery::new(text)?.with_config(config).with_shared_csr_cache(cache.clone());
+```
+
+- Entries are keyed by the committed version's identity, so reopening a
+  dataset reuses its snapshot. A new version is derived from a cached one by
+  rescanning only appended or rewritten fragments and hiding deleted rows; a
+  large change (over a quarter of the table), stable row IDs or a schema change
+  rebuild instead.
+- Least recently used entries that no running query holds are evicted to stay
+  within `max_cache_bytes`, `max_cache_rows` and `max_cache_slots`.
+- A cold build runs once per version without blocking queries on other
+  entries. `cache.stats()` reports usage, full/incremental builds, evictions
+  and rejected builds; `query.csr_adjacency_metrics()` reports per-query
+  native executions, fallbacks, builds and build time.
+
 A builder (`CypherQueryBuilder`) is also available for constructing queries programmatically without parsing text.
 
 ## Supported Cypher Surface

@@ -838,9 +838,9 @@ async fn reachable_node_rows_are_taken_through_a_reused_pinned_id_map() {
         )
         .await
         .unwrap();
-    assert_eq!(snapshot.rows(&Endpoint::Text("e0".into())).len(), 3);
-    assert_eq!(snapshot.rows(&Endpoint::Text("e3".into())).len(), 1);
-    assert!(snapshot.rows(&Endpoint::Text("missing".into())).is_empty());
+    assert_eq!(snapshot.rows(&Endpoint::Text("e0".into())).count(), 3);
+    assert_eq!(snapshot.rows(&Endpoint::Text("e3".into())).count(), 1);
+    assert_eq!(snapshot.rows(&Endpoint::Text("missing".into())).count(), 0);
 }
 
 #[tokio::test]

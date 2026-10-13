@@ -38,6 +38,7 @@
 pub mod ast;
 pub mod case_insensitive;
 pub mod config;
+mod csr_cache;
 pub mod csr_index;
 mod csr_multihop;
 mod csr_provider;
@@ -64,7 +65,7 @@ pub use config::{GraphConfig, NodeMapping, RelationshipMapping};
 pub use csr_index::{
     build_bidirectional_index, try_build_bidirectional_index_with_ids, CsrIndex, CsrIndexBuilder,
 };
-pub use csr_provider::{CsrAdjacencyCache, CsrScanMetrics, CsrScanOptions};
+pub use csr_provider::{CsrAdjacencyCache, CsrCacheStats, CsrScanMetrics, CsrScanOptions};
 pub use csr_walk::{
     csr_walk_filtered, csr_walk_steps_filtered, CsrWalk, CsrWalkOptions, CsrWalkResult,
 };

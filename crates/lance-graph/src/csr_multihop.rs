@@ -82,6 +82,9 @@ pub(super) struct Slice {
 #[derive(Clone)]
 pub(super) struct PathSpec {
     legacy: LogicalPlan,
+    // The complete WHERE, re-applied inside a fallback replay so it is pushed
+    // into the path JOINs exactly as in the ordinary plan.
+    predicate: Option<Expr>,
     slices: Vec<Slice>, // node, edge, node, edge, node, ...
     directions: Vec<RelationshipDirection>,
     edge_dataset: Arc<Dataset>,
@@ -426,12 +429,20 @@ pub(crate) fn try_source(
         directions.push(direction.clone());
         previous = target_variable.clone();
     }
+    // A topology that is known not to fit (or was rejected for this version)
+    // plans the ordinary JOINs now instead of replaying them at execution.
+    let (source, target) = endpoints.unwrap();
+    if !options
+        .cache
+        .admits_adjacency(edge_dataset.as_ref().unwrap(), &source, &target)
+    {
+        return Ok(None);
+    }
     // Cheap logical fallback construction also supplies the exact old Arrow
     // qualifier/type/nullability contract; normal execution has no hop JOINs.
     let legacy =
         DataFusionPlanner::with_catalog(planner.config.clone(), catalog.clone()).plan(op)?;
     let schema = legacy.schema().inner().clone();
-    let (source, target) = endpoints.unwrap();
     for expand in chain {
         if let LogicalOperator::Expand {
             relationship_types, ..
@@ -447,6 +458,7 @@ pub(crate) fn try_source(
     Ok(Some(Arc::new(DefaultTableSource::new(Arc::new(
         NativePathProvider(Arc::new(PathSpec {
             legacy,
+            predicate: options.predicate.clone(),
             slices,
             directions,
             edge_dataset: edge_dataset.unwrap(),
@@ -582,10 +594,17 @@ impl ExecutionPlan for NativePathExec {
                     .iter()
                     .map(|index| col(spec.schema.field(*index).name()))
                     .collect::<Vec<_>>();
-                let fallback = LogicalPlanBuilder::from(spec.legacy.clone())
-                    .project(columns)?
-                    .build()?;
+                // Replay as the ordinary plan would run: the original WHERE
+                // (also kept above this source) is pushed into the JOINs, and
+                // runtime JOIN producers are bound for the CSR/ID sources.
+                let mut fallback = LogicalPlanBuilder::from(spec.legacy.clone());
+                if let Some(predicate) = &spec.predicate {
+                    fallback = fallback.filter(predicate.clone())?;
+                }
+                let fallback = fallback.project(columns)?.build()?;
                 let plan = state.create_physical_plan(&fallback).await?;
+                let plan = crate::runtime_id_filter::bind_runtime_id_sources(plan)?;
+                let plan = crate::csr_provider::bind_csr_runtime_sources(plan)?;
                 let plan = if plan.output_partitioning().partition_count() == 1 {
                     plan
                 } else {

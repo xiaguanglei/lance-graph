@@ -68,6 +68,11 @@ pub struct CsrIndex {
 }
 
 impl CsrIndex {
+    /// Opaque edge identities in CSR order (all sources concatenated).
+    pub(crate) fn edge_ids(&self) -> &[u64] {
+        &self.edge_ids
+    }
+
     /// Look up all neighbors of a vertex. Returns an empty slice for vertices
     /// with no outgoing edges or vertex IDs beyond the index range.
     pub fn neighbors(&self, vertex_id: u64) -> &[u64] {
@@ -392,6 +397,15 @@ impl CsrIndexBuilder {
     pub fn with_num_vertices(mut self, n: u64) -> Self {
         self.num_vertices = Some(n);
         self
+    }
+
+    /// Reserve exact capacity for `additional` more edges, so a builder whose
+    /// edge count is known up front never over-allocates by doubling.
+    pub fn try_reserve_edges(mut self, additional: usize) -> Result<Self> {
+        self.edges
+            .try_reserve_exact(additional)
+            .map_err(|e| csr_error(format!("Cannot allocate CSR input edges: {e}")))?;
+        Ok(self)
     }
 
     /// Add a single directed edge from `src` to `dst`, assigning its input

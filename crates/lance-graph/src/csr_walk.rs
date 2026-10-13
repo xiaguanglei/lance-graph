@@ -87,8 +87,38 @@ where
     walk_indices(steps, start, options, false, &mut allowed)
 }
 
-fn walk_indices<F>(
-    steps: &[&CsrIndex],
+/// Read-only adjacency a bounded walk can traverse: a plain [`CsrIndex`] or a
+/// layered snapshot view (base CSR, hidden fragments and an appended delta).
+pub(crate) trait AdjacencyView {
+    fn num_vertices(&self) -> u64;
+    fn neighbor_edges(&self, vertex: u64) -> impl Iterator<Item = (u64, u64)> + '_;
+}
+
+impl AdjacencyView for CsrIndex {
+    fn num_vertices(&self) -> u64 {
+        CsrIndex::num_vertices(self)
+    }
+    fn neighbor_edges(&self, vertex: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        CsrIndex::neighbor_edges(self, vertex)
+    }
+}
+
+/// [`csr_walk_steps_filtered`] over any adjacency view of one snapshot.
+pub(crate) fn csr_walk_views_filtered<V, F>(
+    steps: &[&V],
+    start: u64,
+    options: CsrWalkOptions,
+    mut allowed: F,
+) -> Result<CsrWalkResult>
+where
+    V: AdjacencyView,
+    F: FnMut(u32, u64, u64, u64) -> bool,
+{
+    walk_indices(steps, start, options, false, &mut allowed)
+}
+
+fn walk_indices<V: AdjacencyView, F>(
+    steps: &[&V],
     start: u64,
     options: CsrWalkOptions,
     repeat: bool,

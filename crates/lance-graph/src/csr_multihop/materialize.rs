@@ -8,7 +8,7 @@ use crate::{
         array_endpoint, endpoint_btree_plan, underlying_lance, AdjacencySnapshot, CsrScanMetrics,
         Endpoint,
     },
-    csr_walk::{csr_walk_steps_filtered, CsrWalkOptions},
+    csr_walk::{csr_walk_views_filtered, AdjacencyView, CsrWalkOptions},
 };
 use arrow_array::{
     Array, ArrayRef, BooleanArray, LargeStringArray, RecordBatch, RecordBatchOptions, StringArray,
@@ -209,14 +209,14 @@ fn candidates(
     let mut frontier = spec
         .source_keys
         .iter()
-        .filter_map(|key| snapshot.vertices.get(key).copied())
+        .filter_map(|key| snapshot.vertex(key))
         .collect::<BTreeSet<_>>();
     let mut rows = BTreeSet::new();
     let mut examined = 0usize;
     for direction in &spec.directions {
         let index = match direction {
-            crate::ast::RelationshipDirection::Outgoing => &snapshot.outgoing,
-            crate::ast::RelationshipDirection::Incoming => &snapshot.incoming,
+            crate::ast::RelationshipDirection::Outgoing => snapshot.view(true),
+            crate::ast::RelationshipDirection::Incoming => snapshot.view(false),
             crate::ast::RelationshipDirection::Undirected => return None,
         };
         let mut next = BTreeSet::new();
@@ -235,7 +235,7 @@ fn candidates(
         }
         vertices.push(
             next.iter()
-                .map(|id| snapshot.endpoints.get(*id as usize).cloned())
+                .map(|id| snapshot.endpoint(*id).cloned())
                 .collect::<Option<BTreeSet<_>>>()?,
         );
         frontier = next;
@@ -393,7 +393,7 @@ async fn take_nodes(
     let mut rows = Vec::new();
     for slot in slots {
         for id in &candidates[*slot / 2] {
-            rows.extend_from_slice(keys.rows(id));
+            rows.extend(keys.rows(id));
             if rows.len() > max_rows.saturating_mul(slots.len()) {
                 return Ok(NodeRead::Reject);
             }
@@ -678,13 +678,14 @@ pub(super) async fn execute(
         .directions
         .iter()
         .map(|direction| match direction {
-            crate::ast::RelationshipDirection::Outgoing => &snapshot.outgoing,
-            crate::ast::RelationshipDirection::Incoming => &snapshot.incoming,
+            crate::ast::RelationshipDirection::Outgoing => snapshot.view(true),
+            crate::ast::RelationshipDirection::Incoming => snapshot.view(false),
             crate::ast::RelationshipDirection::Undirected => {
                 unreachable!("admission rejects undirected")
             }
         })
         .collect::<Vec<_>>();
+    let indices = indices.iter().collect::<Vec<_>>();
     let hops = indices.len() as u32;
     let mut tuples: Vec<Vec<u32>> = Vec::new();
     let mut examined = 0usize;
@@ -692,16 +693,16 @@ pub(super) async fn execute(
         let Some(root_rows) = node_maps[0].get(key) else {
             continue;
         };
-        let Some(start) = snapshot.vertices.get(key) else {
+        let Some(start) = snapshot.vertex(key) else {
             continue;
         };
         let remaining = options.max_edges.saturating_sub(examined);
         if remaining == 0 {
             return Ok(None);
         }
-        let walks = match csr_walk_steps_filtered(
+        let walks = match csr_walk_views_filtered(
             &indices,
-            *start,
+            start,
             CsrWalkOptions {
                 min_hops: hops,
                 max_hops: hops,
@@ -715,8 +716,7 @@ pub(super) async fn execute(
                     .get(&edge)
                     .is_some_and(|row| edge_masks[slot][*row as usize])
                     && snapshot
-                        .endpoints
-                        .get(target as usize)
+                        .endpoint(target)
                         .is_some_and(|id| node_maps[hop as usize].contains_key(id))
             },
         ) {
@@ -729,7 +729,9 @@ pub(super) async fn execute(
                 let mut states = vec![vec![*root_row]];
                 for hop in 0..indices.len() {
                     let edge_row = edge_positions[&walk.edge_ids[hop]];
-                    let vertex = &snapshot.endpoints[walk.vertices[hop + 1] as usize];
+                    let Some(vertex) = snapshot.endpoint(walk.vertices[hop + 1]) else {
+                        return Ok(None);
+                    };
                     let target_rows = &node_maps[hop + 1][vertex];
                     let Some(count) = states.len().checked_mul(target_rows.len()) else {
                         return Ok(None);
