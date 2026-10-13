@@ -35,6 +35,7 @@ let cache = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
     max_cache_rows: 20_000_000,
     max_cache_slots: 32,
     max_column_cache_bytes: 512 << 20, // 属性列缓存（可选，默认 0 关闭），热查询延迟约减半
+    max_column_bytes_per_column: 128 << 20, // 单列上限，避免长文本列挤占整个预算（0 = 不限）
     ..Default::default()
 }));
 let provider = GraphSnapshotProvider::new(namespace, graph_config)
@@ -46,6 +47,8 @@ let provider = GraphSnapshotProvider::new(namespace, graph_config)
 // 就绪探针通过前预热，避免第一个用户请求承担冷构建（80 万边约 600 ms）。
 let snapshot = provider.latest().await?;
 let report = snapshot.warm().await;   // report.skipped > 0 表示有表放不下，会走 JOIN
+// 开启列缓存时 warm() 还会加载节点 ID 列；高频返回/过滤的属性列再显式预热：
+snapshot.warm_columns("Memory", &["visible", "scope", "content"]).await;
 ```
 
 内存估算（每个节点各自一份）：边约 32 B/条常驻，顶点约 160 B/个加上 ID 字符串长度的两倍，
@@ -55,9 +58,10 @@ let report = snapshot.warm().await;   // report.skipped > 0 表示有表放不�
 属性列缓存（`max_column_cache_bytes`）：Lance 本身没有数据页缓存，原生遍历每次都要从存储读取
 返回列和过滤列。开启后这些列按 fragment、按版本缓存在内存中，未变化的 fragment 在新旧版本间共享，
 预算与拓扑缓存独立，放不下时回退为直接读存储（结果不变）。大小约等于被查询列的 Arrow 内存大小
-（字符串列 ≈ 总字节数 + 4 B/行）。本地 20 万节点基准中，热查询 p50 从约 2.3–2.8 ms 降到约 1.0–1.6 ms。
-可在预热时调用 `cache.warm_columns(dataset, &["memory_id", "content", ...])` 预先加载，
-否则在第一次查询时按需加载。
+（字符串列 ≈ 总字节数 + 4 B/行）。本地 20 万节点基准中，热查询 p50 约 0.5–1.0 ms（不开列缓存约 1.6–2.4 ms）。
+未预热的列默认在后台加载，触发加载的那次查询直接读存储（`column_cache_background_fill`，默认开启），
+所以第一次查询不会因为加载整列而变慢；需要“查询等待加载完成”的批处理场景可以关闭。
+就绪前用 `snapshot.warm()`（节点 ID 列）和 `snapshot.warm_columns(label, &[...])`（高频属性）预热。
 
 本地延迟基准（生产读路径：provider + `execute_with_snapshot`，并与 JOIN 结果逐行校验）：
 `cargo run --release -p lance-graph-benches --example graph_snapshot_latency -- 2000 20000 200000`，
@@ -166,7 +170,9 @@ let result = CypherQuery::new(text)?
       max_staleness_ms=500,
       max_cache_bytes=2 << 30, max_column_cache_bytes=512 << 20,
   )
-  provider.latest().warm()                       # 就绪探针前
+  snapshot = provider.latest()
+  snapshot.warm()                                # 就绪探针前
+  snapshot.warm_columns("Memory", ["visible", "content"])
   snapshot = provider.at_least(token) if token else provider.latest()
   table = snapshot.execute(text, parameters={"id": "e0"}, deterministic_order=True)
   # 写接口：返回 GraphVersions({"graph_edges": ds.version, ...}).to_token()

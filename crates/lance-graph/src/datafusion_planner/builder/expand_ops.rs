@@ -5,11 +5,12 @@
 
 use crate::ast::RelationshipDirection;
 use crate::datafusion_planner::analysis::PlanningContext;
+use crate::datafusion_planner::col;
 use crate::datafusion_planner::join_ops::{SourceJoinParams, TargetJoinParams};
 use crate::datafusion_planner::DataFusionPlanner;
 use crate::error::Result;
 use crate::logical_plan::*;
-use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use std::collections::HashMap;
 
 impl DataFusionPlanner {

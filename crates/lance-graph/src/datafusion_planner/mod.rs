@@ -29,6 +29,86 @@ mod test_fixtures;
 // Re-export public types
 pub use analysis::{PlanningContext, QueryAnalysis, RelationshipInstance};
 
+/// `datafusion::logical_expr::col` without the SQL identifier parser for
+/// plain names. DataFusion parses every name as a SQL multipart identifier
+/// and lowercases unquoted parts; an ASCII identifier without dots or quotes
+/// always yields that same unqualified, lowercased column, so only other
+/// names go through the parser. Planning builds hundreds of these per query.
+pub(crate) fn col(name: impl Into<String>) -> datafusion::logical_expr::Expr {
+    let name = name.into();
+    let bytes = name.as_bytes();
+    let plain = bytes
+        .first()
+        .is_some_and(|first| first.is_ascii_alphabetic() || *first == b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+    if plain {
+        datafusion::logical_expr::Expr::Column(datafusion::common::Column::new_unqualified(
+            name.to_ascii_lowercase(),
+        ))
+    } else {
+        datafusion::logical_expr::col(name)
+    }
+}
+
+#[cfg(test)]
+mod col_tests {
+    #[test]
+    fn fast_col_matches_datafusion_for_every_name_shape() {
+        let mut names: Vec<String> = [
+            "a",
+            "A",
+            "a__name",
+            "Person__Name",
+            "_x",
+            "__x",
+            "x1",
+            "x_1_Y",
+            "select",
+            "NULL",
+            "from",
+            "1a",
+            "",
+            "a.b",
+            "A.B",
+            "\"Quoted\"",
+            "\"a.b\"",
+            "a b",
+            "a-b",
+            "é",
+            "aé",
+            "a$b",
+            "#a",
+            "@a",
+            "a__b.c__d",
+            "a.\"B\"",
+            "ROWID",
+            "_rowid",
+            "a\"b",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        // Every ASCII printable two- and three-character string.
+        let printable = (0x20u8..0x7f).map(char::from).collect::<Vec<_>>();
+        for a in &printable {
+            for b in &printable {
+                names.push(format!("{a}{b}"));
+                names.push(format!("{a}{b}x"));
+                names.push(format!("x{a}{b}"));
+            }
+        }
+        for name in names {
+            assert_eq!(
+                super::col(name.clone()),
+                datafusion::logical_expr::col(name.as_str()),
+                "{name:?}"
+            );
+        }
+    }
+}
+
 use crate::config::GraphConfig;
 use crate::error::Result;
 use crate::logical_plan::LogicalOperator;

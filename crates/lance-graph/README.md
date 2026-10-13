@@ -160,9 +160,18 @@ let query = CypherQuery::new(text)?.with_config(config).with_shared_csr_cache(ca
 - `max_column_cache_bytes` (default 0, off) additionally keeps the property
   columns that native traversals read in memory, per fragment and per version,
   under its own budget; unchanged fragments are shared across versions. It
-  roughly halves hot latency because Lance has no data page cache. Prefill
-  with `cache.warm_columns(dataset, &["col", ...])`; `stats().column_entries`
-  / `column_bytes` and the per-query `column_cache_reads` show its use.
+  roughly halves hot latency because Lance has no data page cache. A missing
+  column loads in the background while that query reads storage
+  (`column_cache_background_fill`), so a first query is never slower than
+  without it; `max_column_bytes_per_column` keeps one wide column from taking
+  the whole budget. `GraphSnapshot::warm()` also loads node ID columns and
+  `GraphSnapshot::warm_columns(label, &[...])` hot properties;
+  `stats().column_entries` / `column_bytes` and the per-query
+  `column_cache_reads` show its use.
+- Plans driven by the native operator run in a lean DataFusion session (one
+  partition, only the optimizer rules the physical planner needs), which
+  removes most of the planning time from hot queries; any other plan uses
+  the regular session.
 - Multi-node services should read through `GraphSnapshotProvider` (one per
   node and security context): it pins every table to one version per query,
   serves read-your-writes via `GraphVersions` tokens (`at_least`) and exact

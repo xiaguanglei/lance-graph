@@ -121,7 +121,7 @@ impl Contexts {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             general: SessionContext::new(),
-            native: crate::csr_multihop::native_session(SessionConfig::new()),
+            native: crate::native_session::native_session(SessionConfig::new()),
         })
     }
 }
@@ -153,6 +153,8 @@ pub struct WarmReport {
     /// Entries that are unsupported or do not fit the cache limits; queries
     /// over them plan ordinary JOINs.
     pub skipped: usize,
+    /// Node ID columns now in the column cache (when it is enabled).
+    pub columns: usize,
 }
 
 impl std::fmt::Debug for GraphSnapshot {
@@ -252,9 +254,11 @@ impl GraphSnapshot {
         (&self.contexts.general, &self.contexts.native)
     }
 
-    /// Build every relationship adjacency and node-ID map of these versions,
-    /// e.g. before a node reports ready or after a write notification, so the
-    /// first query does not pay a cold build.
+    /// Build every relationship adjacency and node-ID map of these versions
+    /// (and, with the column cache enabled, load every node ID column), e.g.
+    /// before a node reports ready or after a write notification, so the
+    /// first query does not pay a cold build. Hot property columns can be
+    /// added with [`GraphSnapshot::warm_columns`].
     pub async fn warm(&self) -> WarmReport {
         let mut report = WarmReport::default();
         for (rel_type, table) in &self.bindings.relationships {
@@ -288,8 +292,32 @@ impl GraphSnapshot {
             } else {
                 report.skipped += 1;
             }
+            if self.cache.options().max_column_cache_bytes > 0 {
+                report.columns += self
+                    .cache
+                    .warm_columns(self.datasets[table].clone(), &[&mapping.id_field])
+                    .await;
+            }
         }
         report
+    }
+
+    /// Load these stored columns of the table behind a node label or
+    /// relationship type into the column cache (needs
+    /// `max_column_cache_bytes`), e.g. properties most queries return or
+    /// filter on. Returns how many are cached; 0 for an unknown label.
+    pub async fn warm_columns(&self, label_or_type: &str, columns: &[&str]) -> usize {
+        let table = self
+            .bindings
+            .nodes
+            .iter()
+            .chain(&self.bindings.relationships)
+            .find(|(name, _)| name.eq_ignore_ascii_case(label_or_type))
+            .map(|(_, table)| table);
+        match table.and_then(|table| self.datasets.get(table)) {
+            Some(dataset) => self.cache.warm_columns(dataset.clone(), columns).await,
+            None => 0,
+        }
     }
 }
 

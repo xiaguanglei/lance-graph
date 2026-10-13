@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{PathSpec, Slice};
+use crate::datafusion_planner::col;
 use crate::{
     case_insensitive::qualify_column,
     csr_provider::{
@@ -21,7 +22,7 @@ use datafusion::{
         DFSchema, Result,
     },
     execution::SessionState,
-    logical_expr::{col, lit, Expr},
+    logical_expr::{lit, Expr},
 };
 use futures::TryStreamExt;
 use lance::dataset::ProjectionRequest;

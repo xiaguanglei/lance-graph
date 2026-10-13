@@ -3,10 +3,11 @@
 
 //! Aggregation operations: Projection with aggregates and grouping
 
+use crate::datafusion_planner::col;
 use crate::datafusion_planner::DataFusionPlanner;
 use crate::error::Result;
 use crate::logical_plan::*;
-use datafusion::logical_expr::{col, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 
 impl DataFusionPlanner {
     pub(crate) fn build_project_with_aggregates(

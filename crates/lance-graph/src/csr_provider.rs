@@ -7,6 +7,7 @@
 //! runtime parent filters remain in place. Volatile predicates are not pushed.
 //! No global cache, persistent sidecar, business rules, or BFS/path rewrite.
 
+use crate::datafusion_planner::col;
 use crate::{csr_walk::AdjacencyView, GraphConfig};
 use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, UInt64Array};
 use arrow_schema::{DataType, Schema, SchemaRef};
@@ -20,7 +21,7 @@ use datafusion::{
     },
     datasource::{source_as_provider, DefaultTableSource, TableProvider},
     execution::{SessionState, TaskContext},
-    logical_expr::{col, lit, Expr, Operator, TableProviderFilterPushDown, TableSource, TableType},
+    logical_expr::{lit, Expr, Operator, TableProviderFilterPushDown, TableSource, TableType},
     physical_expr::{
         expressions::{BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal},
         EquivalenceProperties, PhysicalExpr,
@@ -81,6 +82,14 @@ pub struct CsrScanOptions {
     /// version (shared across versions per unchanged fragment) and evicted
     /// least-recently-used within this budget, separately from adjacency.
     pub max_column_cache_bytes: usize,
+    /// Largest single cached column (all its fragments of one version), so
+    /// one wide column (long text) cannot take the whole budget and evict
+    /// the small hot ones. 0 allows up to `max_column_cache_bytes`.
+    pub max_column_bytes_per_column: usize,
+    /// Load a missing column in a background task and serve the query that
+    /// missed it from storage, so a first query is never slower than without
+    /// the cache (default). When false the query waits for the load.
+    pub column_cache_background_fill: bool,
 }
 
 impl Default for CsrScanOptions {
@@ -95,6 +104,8 @@ impl Default for CsrScanOptions {
             max_bound_keys: 256,
             max_take_rows: 20_000,
             max_column_cache_bytes: 0,
+            max_column_bytes_per_column: 0,
+            column_cache_background_fill: true,
         }
     }
 }

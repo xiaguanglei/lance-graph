@@ -6,13 +6,12 @@
 //! Helpers for constructing table scans with qualified columns
 
 use super::analysis::{PlanningContext, RelationshipInstance};
+use super::col;
 use crate::ast::PropertyValue;
 use crate::case_insensitive::qualify_column;
 use crate::config::RelationshipMapping;
 use crate::error::Result;
-use datafusion::logical_expr::{
-    col, lit, BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator,
-};
+use datafusion::logical_expr::{lit, BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator};
 use lance_graph_catalog::GraphSourceCatalog;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

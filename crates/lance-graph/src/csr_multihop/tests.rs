@@ -457,10 +457,26 @@ async fn compare(text: &str, fixture: &Fixture, expected_native: bool) -> Record
             > 0,
         expected_native
     );
+    // The same native query through the lean native session that snapshot
+    // reads use must keep the complete Arrow contract and rows.
+    let lean = query(text, fixture, true)
+        .execute_with_catalog_and_context_inner(
+            fixture.catalog.clone(),
+            context(fixture),
+            Some(crate::native_session::native_session(
+                datafusion::prelude::SessionConfig::new(),
+            )),
+            Some(1000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(baseline.schema(), lean.schema(), "lean session contract");
+    assert_eq!(row_keys(&baseline), row_keys(&lean), "lean session rows");
     // The same query with property columns served from the column cache, cold
     // (columns built) and hot (read from memory), must return the same rows.
     let columns = Arc::new(CsrAdjacencyCache::new(crate::CsrScanOptions {
         max_column_cache_bytes: 64 << 20,
+        column_cache_background_fill: false,
         ..fixture.cache.options().clone()
     }));
     for round in 0..2 {

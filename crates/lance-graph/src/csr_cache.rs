@@ -798,10 +798,11 @@ impl CsrAdjacencyCache {
 
     /// Rows `rows` (row addresses, any order, duplicates allowed) of stored
     /// `columns`, served from cached columns without storage I/O. None when
-    /// the column cache is disabled, a column does not fit, or a row is not
-    /// cached; callers then read through Lance.
+    /// the column cache is disabled, a column does not fit, is still loading
+    /// or a row is not cached; callers then read through Lance. A missing
+    /// column is loaded in the background (or inline, per options).
     pub(crate) async fn cached_take(
-        &self,
+        self: &Arc<Self>,
         dataset: &Arc<Dataset>,
         rows: &[u64],
         columns: &[&str],
@@ -814,9 +815,39 @@ impl CsrAdjacencyCache {
             return None;
         }
         let schema = Arc::new(Schema::from(&dataset.schema().project(columns).ok()?));
-        let mut arrays = Vec::with_capacity(schema.fields().len());
+        let background = self.options.column_cache_background_fill
+            && tokio::runtime::Handle::try_current().is_ok();
+        let mut snapshots = Vec::with_capacity(schema.fields().len());
+        let mut missing = false;
         for field in schema.fields() {
-            let column = self.column(dataset.clone(), field.name(), metrics).await?;
+            let snapshot = if background {
+                match self.ready_column(dataset, field.name()) {
+                    Some(Some(snapshot)) => Some(snapshot),
+                    // Loading, rejected or not a stored column.
+                    None => None,
+                    Some(None) => {
+                        // Load every missing column concurrently, off this query.
+                        let (cache, dataset, name) =
+                            (self.clone(), dataset.clone(), field.name().clone());
+                        tokio::spawn(async move {
+                            cache
+                                .column(dataset, &name, &CsrScanMetrics::default())
+                                .await;
+                        });
+                        None
+                    }
+                }
+            } else {
+                Some(self.column(dataset.clone(), field.name(), metrics).await?)
+            };
+            missing |= snapshot.is_none();
+            snapshots.push(snapshot);
+        }
+        if missing {
+            return None;
+        }
+        let mut arrays = Vec::with_capacity(schema.fields().len());
+        for (field, column) in schema.fields().iter().zip(snapshots.into_iter().flatten()) {
             let mut sources: Vec<&dyn Array> = Vec::new();
             let mut source_of: HashMap<usize, usize> = HashMap::new();
             let mut indices = Vec::with_capacity(rows.len());
@@ -845,20 +876,42 @@ impl CsrAdjacencyCache {
         Some(batch)
     }
 
+    fn column_key(dataset: &Dataset, name: &str) -> Option<CacheKey> {
+        let field = dataset.schema().field(name)?;
+        Some(CacheKey::new(
+            dataset,
+            Kind::Column {
+                field: field.id,
+                data_type: field.data_type(),
+            },
+        ))
+    }
+
+    /// Without waiting: `Some(Some(_))` when the column of this version is
+    /// cached, `Some(None)` when it is not yet requested, `None` when it is
+    /// loading or was rejected (read storage, start nothing).
+    fn ready_column(&self, dataset: &Dataset, name: &str) -> Option<Option<Arc<ColumnSnapshot>>> {
+        let key = Self::column_key(dataset, name)?;
+        let mut state = self.state.lock().expect("CSR cache lock");
+        state.tick += 1;
+        let tick = state.tick;
+        let Some(slot) = state.slots.get_mut(&key) else {
+            return Some(None);
+        };
+        slot.last_used = tick;
+        match slot.cell.get() {
+            Some(Outcome::Ready(Cached::Column(snapshot))) => Some(Some(snapshot.clone())),
+            _ => None,
+        }
+    }
+
     async fn column(
         &self,
         dataset: Arc<Dataset>,
         name: &str,
         metrics: &CsrScanMetrics,
     ) -> Option<Arc<ColumnSnapshot>> {
-        let field = dataset.schema().field(name)?;
-        let key = CacheKey::new(
-            &dataset,
-            Kind::Column {
-                field: field.id,
-                data_type: field.data_type(),
-            },
-        );
+        let key = Self::column_key(&dataset, name)?;
         let built = self
             .lookup(key.clone(), metrics, |candidate| async move {
                 let started = Instant::now();
@@ -895,7 +948,10 @@ impl CsrAdjacencyCache {
         if dataset.schema().field(name).is_none() {
             return self.rejected();
         }
-        let budget = self.options.max_column_cache_bytes;
+        let budget = match self.options.max_column_bytes_per_column {
+            0 => self.options.max_column_cache_bytes,
+            cap => cap.min(self.options.max_column_cache_bytes),
+        };
         let current = signatures(dataset);
         let mut fragments = HashMap::new();
         let mut missing = Vec::new();
@@ -2262,11 +2318,12 @@ mod tests {
         let uri = uri.to_str().unwrap();
         let mut rng = Rng(21);
         let mut dataset = write(uri, &rng.rows(300, 0), WriteMode::Create, false).await;
-        let cache = CsrAdjacencyCache::new(CsrScanOptions {
+        let cache = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
             max_column_cache_bytes: 16 << 20,
+            column_cache_background_fill: false,
             ..options()
-        });
-        assert!(CsrAdjacencyCache::new(options())
+        }));
+        assert!(Arc::new(CsrAdjacencyCache::new(options()))
             .cached_take(
                 &Arc::new(dataset.clone()),
                 &[0],
@@ -2344,10 +2401,11 @@ mod tests {
         assert!(stats.column_bytes > 0 && stats.column_bytes <= 16 << 20);
         assert!(stats.incremental_builds > 0, "{stats:?}");
         // A budget too small for one column is rejected, not partially cached.
-        let tiny = CsrAdjacencyCache::new(CsrScanOptions {
+        let tiny = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
             max_column_cache_bytes: 64,
+            column_cache_background_fill: false,
             ..options()
-        });
+        }));
         let current = Arc::new(dataset.clone());
         assert!(tiny
             .cached_take(
@@ -2370,7 +2428,12 @@ mod tests {
         use lance::dataset::{
             ColumnAlteration, NewColumnTransform, ProjectionRequest, UpdateBuilder,
         };
-        async fn check(cache: &CsrAdjacencyCache, dataset: &Dataset, latest: bool, step: &str) {
+        async fn check(
+            cache: &Arc<CsrAdjacencyCache>,
+            dataset: &Dataset,
+            latest: bool,
+            step: &str,
+        ) {
             let dataset = Arc::new(dataset.clone());
             let rows = live_rows(&dataset).await;
             let names = dataset
@@ -2404,10 +2467,11 @@ mod tests {
         let uri = path.to_str().unwrap();
         let mut rng = Rng(5);
         let mut dataset = write(uri, &rng.rows(120, 0), WriteMode::Create, false).await;
-        let cache = CsrAdjacencyCache::new(CsrScanOptions {
+        let cache = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
             max_column_cache_bytes: 16 << 20,
+            column_cache_background_fill: false,
             ..options()
-        });
+        }));
         let mut history = vec![dataset.version_id()];
         let steps = [
             "create",
@@ -2494,5 +2558,96 @@ mod tests {
             }
             check(&cache, &dataset, true, step).await;
         }
+    }
+
+    /// Background fill: a miss is served by the caller from storage while the
+    /// column loads; later reads equal storage reads. The per-column cap
+    /// rejects a column larger than it without touching smaller ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_fill_serves_storage_first_then_cache() {
+        use lance::dataset::ProjectionRequest;
+        let temp = tempfile::tempdir().unwrap();
+        let uri = temp.path().join("edges.lance");
+        let uri = uri.to_str().unwrap();
+        let mut rng = Rng(9);
+        let dataset = Arc::new(write(uri, &rng.rows(500, 0), WriteMode::Create, false).await);
+        let rows = live_rows(&dataset).await;
+        let expected = |name: &'static str| {
+            let dataset = dataset.clone();
+            let rows = rows.clone();
+            async move {
+                let projection = Arc::new(dataset.schema().project(&[name]).unwrap());
+                dataset
+                    .take_rows(&rows, ProjectionRequest::Schema(projection))
+                    .await
+                    .unwrap()
+            }
+        };
+        let cache = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 16 << 20,
+            ..options()
+        }));
+        assert!(cache.options().column_cache_background_fill);
+        let metrics = CsrScanMetrics::default();
+        assert!(cache
+            .cached_take(&dataset, &rows, &["dst", "w"], &metrics)
+            .await
+            .is_none());
+        let mut served = None;
+        for _ in 0..500 {
+            served = cache
+                .cached_take(&dataset, &rows, &["dst", "w"], &metrics)
+                .await;
+            if served.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let served = served.expect("background fill completes");
+        let projection = Arc::new(dataset.schema().project(&["dst", "w"]).unwrap());
+        let both = dataset
+            .take_rows(&rows, ProjectionRequest::Schema(projection))
+            .await
+            .unwrap();
+        assert_eq!(served, both);
+        assert_eq!(metrics.column_cache_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().column_entries, 2);
+        // Per-column cap between the two columns' sizes: the larger column is
+        // rejected for good, the smaller one is still cached under it.
+        let mut sizes = Vec::new();
+        for name in ["src", "w"] {
+            let alone = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+                max_column_cache_bytes: 16 << 20,
+                column_cache_background_fill: false,
+                ..options()
+            }));
+            alone
+                .cached_take(&dataset, &rows, &[name], &metrics)
+                .await
+                .unwrap();
+            sizes.push((alone.stats().column_bytes, name));
+        }
+        sizes.sort();
+        let ((small_bytes, small), (large_bytes, large)) = (sizes[0], sizes[1]);
+        assert!(small_bytes < large_bytes, "{sizes:?}");
+        let capped = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 16 << 20,
+            max_column_bytes_per_column: (small_bytes + large_bytes) / 2,
+            column_cache_background_fill: false,
+            ..options()
+        }));
+        assert!(capped
+            .cached_take(&dataset, &rows, &[large], &metrics)
+            .await
+            .is_none());
+        assert_eq!(
+            capped
+                .cached_take(&dataset, &rows, &[small], &metrics)
+                .await
+                .unwrap(),
+            expected(small).await
+        );
+        assert!(capped.stats().rejected_builds >= 1);
+        assert_eq!(capped.stats().column_entries, 1);
     }
 }

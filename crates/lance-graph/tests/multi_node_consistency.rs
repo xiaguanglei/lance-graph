@@ -634,6 +634,48 @@ async fn warm_prepares_every_table_before_the_first_query() {
     assert_eq!(report.skipped, 0);
     assert_eq!(node.cache().stats().full_builds, builds);
     assert!(node.cache().stats().incremental_builds >= 1);
+    assert_eq!(report.columns, 0, "column cache disabled");
+
+    // With the column cache, warm() loads every node ID column and
+    // warm_columns() the hot properties: the first query reads no storage
+    // for them and returns the same rows as the JOIN plan.
+    let node = graph.provider(Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+        max_column_cache_bytes: 32 << 20,
+        ..Default::default()
+    })));
+    let snapshot = node.latest().await.unwrap();
+    let report = snapshot.warm().await;
+    assert_eq!((report.node_ids, report.columns, report.skipped), (2, 2, 0));
+    assert_eq!(
+        snapshot
+            .warm_columns("memory", &["visible", "content"])
+            .await,
+        2
+    );
+    assert_eq!(snapshot.warm_columns("MENTIONS", &["edge_id"]).await, 1);
+    assert_eq!(snapshot.warm_columns("Unknown", &["edge_id"]).await, 0);
+    assert_eq!(
+        snapshot.warm_columns("Memory", &["no_such_column"]).await,
+        0
+    );
+    let text = QUERIES[1];
+    let first = query(text, true);
+    let rows = first.execute_with_snapshot(&snapshot).await.unwrap();
+    let joins = query(text, false)
+        .execute_with_snapshot(&snapshot)
+        .await
+        .unwrap();
+    assert_eq!(bag(&rows), bag(&joins));
+    assert!(rows.num_rows() > 0);
+    let metrics = first.csr_adjacency_metrics();
+    assert_eq!(
+        metrics.native_multihop_executions.load(Ordering::Relaxed),
+        1
+    );
+    assert!(
+        metrics.column_cache_reads.load(Ordering::Relaxed) >= 2,
+        "{metrics:?}"
+    );
 }
 
 #[tokio::test]
@@ -757,8 +799,10 @@ async fn schema_changes_and_rewrites_stay_exact_on_every_node() {
     let graph = graph().await;
     let nodes = [
         graph.provider(Arc::new(CsrAdjacencyCache::default())),
+        // Loads columns inline; the next node fills them in the background.
         graph.provider(Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
             max_column_cache_bytes: 32 << 20,
+            column_cache_background_fill: false,
             ..Default::default()
         }))),
         graph.provider(Arc::new(CsrAdjacencyCache::new(CsrScanOptions {

@@ -3,6 +3,7 @@
 
 //! Opt-in completed JOIN ID membership pushdown into unchanged Lance scanners.
 //! All business joins remain in place; this only narrows an indexed node scan.
+use crate::datafusion_planner::col;
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -10,7 +11,7 @@ use datafusion::{
     common::{config::ConfigOptions, Result, ScalarValue, Statistics},
     datasource::TableProvider,
     execution::{SessionState, TaskContext},
-    logical_expr::{col, lit, Expr, Operator, TableProviderFilterPushDown, TableType},
+    logical_expr::{lit, Expr, Operator, TableProviderFilterPushDown, TableType},
     physical_expr::{
         expressions::{BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal},
         PhysicalExpr,

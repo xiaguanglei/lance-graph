@@ -700,7 +700,7 @@ impl CypherQuery {
             .await
     }
 
-    async fn execute_with_catalog_and_context_inner(
+    pub(crate) async fn execute_with_catalog_and_context_inner(
         &self,
         catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         ctx: datafusion::execution::context::SessionContext,
@@ -714,7 +714,12 @@ impl CypherQuery {
         // A plan driven by one native CSR operator produces a small result on
         // one partition: plan and run it without repartitioning.
         let ctx = match native_ctx {
-            Some(native_ctx) if crate::csr_multihop::is_native_plan(&df_logical_plan) => native_ctx,
+            Some(native_ctx)
+                if crate::csr_multihop::is_native_plan(&df_logical_plan)
+                    && crate::native_session::lean_plan(&df_logical_plan) =>
+            {
+                native_ctx
+            }
             _ => ctx,
         };
 

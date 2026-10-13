@@ -10,6 +10,7 @@ mod materialize;
 #[cfg(test)]
 mod tests;
 
+use crate::datafusion_planner::col;
 use crate::{
     ast::{
         CypherQuery as QueryAst, GraphPattern, PropertyValue, ReadingClause, RelationshipDirection,
@@ -32,7 +33,7 @@ use datafusion::{
     },
     datasource::{source_as_provider, DefaultTableSource, MemTable, TableProvider},
     execution::{SessionState, TaskContext},
-    logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType},
+    logical_expr::{lit, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         coalesce_partitions::CoalescePartitionsExec,
@@ -78,16 +79,6 @@ pub(crate) fn is_native_plan(plan: &LogicalPlan) -> bool {
         Ok(matches!(node, LogicalPlan::TableScan(scan) if scan.table_name.table() == NATIVE_TABLE))
     })
     .unwrap_or(false)
-}
-
-/// Session for plans driven by the native operator: its output is one small
-/// partition, so repartitioning for parallelism only adds task hand-offs.
-pub(crate) fn native_session(
-    config: datafusion::prelude::SessionConfig,
-) -> datafusion::execution::context::SessionContext {
-    datafusion::execution::context::SessionContext::new_with_config(
-        config.with_target_partitions(1),
-    )
 }
 
 #[derive(Debug, Clone)]
@@ -521,13 +512,16 @@ impl TableProvider for NativePathProvider {
         _: &[Expr],
         _: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let session = state
-            .as_any()
-            .downcast_ref::<SessionState>()
-            .ok_or_else(|| {
-                DataFusionError::Plan("Native CSR multi-hop requires SessionState".into())
-            })?
-            .clone();
+        // One copy per plan, shared by every execution of it.
+        let session = Arc::new(
+            state
+                .as_any()
+                .downcast_ref::<SessionState>()
+                .ok_or_else(|| {
+                    DataFusionError::Plan("Native CSR multi-hop requires SessionState".into())
+                })?
+                .clone(),
+        );
         let indices = projection
             .cloned()
             .unwrap_or_else(|| (0..self.0.schema.fields().len()).collect());
@@ -549,7 +543,7 @@ impl TableProvider for NativePathProvider {
 #[derive(Debug)]
 struct NativePathExec {
     spec: Arc<PathSpec>,
-    session: SessionState,
+    session: Arc<SessionState>,
     indices: Vec<usize>,
     properties: Arc<PlanProperties>,
 }

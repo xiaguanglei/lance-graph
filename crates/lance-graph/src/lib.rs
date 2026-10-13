@@ -49,6 +49,7 @@ mod graph_snapshot;
 pub mod lance_native_planner;
 pub mod lance_vector_search;
 pub mod logical_plan;
+mod native_session;
 pub mod parameter_substitution;
 pub mod parser;
 pub mod query;
