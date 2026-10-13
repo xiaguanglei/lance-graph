@@ -862,7 +862,7 @@ fn exact_csr_output(
 
 // Metadata admission is exact and pinned; execution coverage, append fragments
 // and deletion masks remain the native Lance scanner's responsibility.
-pub(crate) async fn endpoint_btrees(
+async fn endpoint_btrees(
     dataset: &Dataset,
     source: &str,
     target: &str,

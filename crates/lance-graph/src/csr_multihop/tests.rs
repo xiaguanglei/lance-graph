@@ -883,25 +883,32 @@ async fn shared_table_aliases_hoist_id_list_for_node_btree() {
     let text = "MATCH (a:Entity {entity_id:'e0'})-[r1:REL]->(b:Entity)-[r2:REL]->(c:Entity)-[r3:REL]->(d:Entity) \
         WHERE b.allowed = true AND c.allowed = true AND d.allowed = true \
         RETURN b.entity_id, c.entity_id, d.entity_id, r1.edge_id, r2.edge_id, r3.edge_id";
-    compare(text, &fixture, true).await;
-    let q = query(text, &fixture, true);
-    q.execute_with_catalog_and_context(fixture.catalog.clone(), SessionContext::new())
-        .await
-        .unwrap();
-    let metrics = q.csr_adjacency_metrics();
-    assert_eq!(
-        metrics
-            .native_multihop_node_index_reads
-            .load(Ordering::Relaxed),
-        1
-    );
-    // An existing ID BTree is preferred over a resident ID map.
-    assert_eq!(
-        metrics
-            .native_multihop_node_take_reads
-            .load(Ordering::Relaxed),
-        0
-    );
+    async fn reads(text: &str, fixture: &Fixture) -> (u64, u64) {
+        compare(text, fixture, true).await;
+        let q = query(text, fixture, true);
+        q.execute_with_catalog_and_context(fixture.catalog.clone(), SessionContext::new())
+            .await
+            .unwrap();
+        let metrics = q.csr_adjacency_metrics();
+        (
+            metrics
+                .native_multihop_node_index_reads
+                .load(Ordering::Relaxed),
+            metrics
+                .native_multihop_node_take_reads
+                .load(Ordering::Relaxed),
+        )
+    }
+    // The resident ID map is faster than the BTree scan and wins when it fits.
+    assert_eq!(reads(text, &fixture).await, (0, 1));
+    // 12 edges fit; the 4-row Entity map does not, so the hoisted ID list must
+    // let the scan use the BTree despite the multi-alias OR.
+    fixture.cache = Arc::new(CsrAdjacencyCache::new(crate::CsrScanOptions {
+        max_take_rows: 100,
+        max_cache_rows: 14,
+        ..Default::default()
+    }));
+    assert_eq!(reads(text, &fixture).await, (1, 0));
 }
 
 #[tokio::test]

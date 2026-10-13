@@ -297,7 +297,9 @@ async fn main() {
                     let metrics = q.csr_adjacency_metrics();
                     assert_eq!(metrics.native_multihop_executions.load(Ordering::Relaxed), u64::from(native && expect_native));
                     assert_eq!(metrics.native_multihop_fallbacks.load(Ordering::Relaxed), 0);
-                    if native && expect_native && indexed && !observe { assert!(metrics.native_multihop_node_index_reads.load(Ordering::Relaxed) >= 1); }
+                    // Nodes come from the resident ID map, or from a node-ID BTree
+                    // scan when the map does not fit; never from an unindexed scan.
+                    if native && expect_native && !observe { assert!(metrics.native_multihop_node_take_reads.load(Ordering::Relaxed) + metrics.native_multihop_node_index_reads.load(Ordering::Relaxed) >= 1, "{name} node reads (btree={indexed}): {metrics:?}"); }
                     index_reads += metrics.native_multihop_node_index_reads.load(Ordering::Relaxed); take_reads += metrics.native_multihop_node_take_reads.load(Ordering::Relaxed);
                     inputs += metrics.native_multihop_input_rows.load(Ordering::Relaxed); bytes += metrics.native_multihop_input_bytes.load(Ordering::Relaxed); checks += metrics.native_multihop_edge_checks.load(Ordering::Relaxed);
                 }
