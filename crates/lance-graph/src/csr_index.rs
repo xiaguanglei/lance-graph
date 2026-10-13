@@ -357,7 +357,6 @@ struct InputEdge {
     src: u64,
     dst: u64,
     id: u64,
-    ordinal: usize,
 }
 
 fn csr_error(message: impl Into<String>) -> GraphError {
@@ -404,7 +403,6 @@ impl CsrIndexBuilder {
             src,
             dst,
             id: ordinal as u64,
-            ordinal,
         });
         self
     }
@@ -419,12 +417,10 @@ impl CsrIndexBuilder {
         self.edges
             .try_reserve(1)
             .map_err(|e| csr_error(format!("Cannot allocate CSR input edge: {e}")))?;
-        let ordinal = self.edges.len();
         self.edges.push(InputEdge {
             src,
             dst,
             id: edge_id,
-            ordinal,
         });
         Ok(self)
     }
@@ -487,7 +483,7 @@ impl CsrIndexBuilder {
     /// Duplicate identities are retained, not deduplicated: callers must ensure
     /// they identify the same property record, especially when mixing explicit
     /// identities with the legacy ordinal-based APIs.
-    pub fn try_build(mut self) -> Result<CsrIndex> {
+    pub fn try_build(self) -> Result<CsrIndex> {
         for edge in &self.edges {
             self.validate_endpoints(edge.src, edge.dst)?;
         }
@@ -518,27 +514,39 @@ impl CsrIndexBuilder {
         neighbors
             .try_reserve_exact(self.edges.len())
             .map_err(|e| csr_error(format!("Cannot allocate CSR destinations: {e}")))?;
+        neighbors.resize(self.edges.len(), 0u64);
         let mut edge_ids = Vec::new();
         edge_ids
             .try_reserve_exact(self.edges.len())
             .map_err(|e| csr_error(format!("Cannot allocate CSR edge identities: {e}")))?;
+        edge_ids.resize(self.edges.len(), 0u64);
 
-        // Sorting by ordinal within a source retains parallel-edge input order.
-        self.edges
-            .sort_unstable_by_key(|edge| (edge.src, edge.ordinal));
+        // Stable counting sort on the dense source: O(E + V) instead of an
+        // O(E log E) comparison sort. `edges` is in input order, so parallel
+        // edges keep their input order within each source.
         for edge in &self.edges {
             let slot = &mut offsets[edge.src as usize + 1];
             *slot = slot
                 .checked_add(1)
                 .ok_or_else(|| csr_error("CSR degree overflow"))?;
-            neighbors.push(edge.dst);
-            edge_ids.push(edge.id);
         }
         for v in 1..offsets.len() {
             offsets[v] = offsets[v]
                 .checked_add(offsets[v - 1])
                 .ok_or_else(|| csr_error("CSR offset overflow"))?;
         }
+        // offsets[src] is used as the insertion cursor, leaving it at the end
+        // of `src`, i.e. the start of `src + 1`; shift back afterwards.
+        for edge in &self.edges {
+            let cursor = &mut offsets[edge.src as usize];
+            neighbors[*cursor as usize] = edge.dst;
+            edge_ids[*cursor as usize] = edge.id;
+            *cursor += 1;
+        }
+        for v in (1..offsets.len()).rev() {
+            offsets[v] = offsets[v - 1];
+        }
+        offsets[0] = 0;
         Ok(CsrIndex {
             offsets,
             neighbors,

@@ -787,3 +787,114 @@ fn public_shape_hint_is_not_native_execution_evidence() {
             .native_multihop_candidate());
     }
 }
+
+#[tokio::test]
+async fn reachable_node_rows_are_taken_through_a_reused_pinned_id_map() {
+    let fixture = fixture(true, false, 100, false).await;
+    let text = "MATCH (a:Entity {entity_id:'e0'})-[r1:REL]->(b:Entity)-[r2:REL]->(c:Entity)-[r3:REL]->(d:Entity) \
+        WHERE b.allowed = true RETURN b.name, c.entity_id, d.entity_id, r3.edge_id";
+    compare(text, &fixture, true).await;
+    let first = query(text, &fixture, true);
+    first
+        .execute_with_catalog_and_context(fixture.catalog.clone(), SessionContext::new())
+        .await
+        .unwrap();
+    let metrics = first.csr_adjacency_metrics();
+    // compare() already built the Entity ID map; this query only reuses it.
+    assert_eq!(
+        metrics
+            .native_multihop_node_key_builds
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        metrics
+            .native_multihop_node_take_reads
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        metrics
+            .native_multihop_node_index_reads
+            .load(Ordering::Relaxed),
+        0
+    );
+    // Only rows of reachable IDs (with their duplicates) are read, not the table.
+    let snapshot = fixture
+        .cache
+        .node_keys(
+            underlying_lance(
+                &source_as_provider(&fixture.catalog.node_source("Entity").unwrap()).unwrap(),
+            )
+            .unwrap()
+            .dataset(),
+            "entity_id",
+            &metrics,
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.rows(&Endpoint::Text("e0".into())).len(), 3);
+    assert_eq!(snapshot.rows(&Endpoint::Text("e3".into())).len(), 1);
+    assert!(snapshot.rows(&Endpoint::Text("missing".into())).is_empty());
+}
+
+#[tokio::test]
+async fn shared_table_aliases_hoist_id_list_for_node_btree() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::{scalar::ScalarIndexParams, IndexType};
+    let mut fixture = fixture(false, false, 100, false).await;
+    let entities = source_as_provider(&fixture.catalog.node_source("Entity").unwrap()).unwrap();
+    let mut entities = underlying_lance(&entities)
+        .unwrap()
+        .dataset()
+        .as_ref()
+        .clone();
+    entities
+        .create_index_builder(
+            &["entity_id"],
+            IndexType::BTree,
+            &ScalarIndexParams::default(),
+        )
+        .await
+        .unwrap();
+    fixture.catalog = Arc::new(
+        InMemoryCatalog::new()
+            .with_node_source(
+                "Entity",
+                Arc::new(DefaultTableSource::new(Arc::new(LanceTableProvider::new(
+                    Arc::new(entities),
+                    false,
+                    false,
+                )))),
+            )
+            .with_node_source("Memory", fixture.catalog.node_source("Memory").unwrap())
+            .with_relationship_source(
+                "MENTIONS",
+                fixture.catalog.relationship_source("MENTIONS").unwrap(),
+            )
+            .with_relationship_source("REL", fixture.catalog.relationship_source("REL").unwrap()),
+    );
+    // Four Entity aliases with different masks share one pushed node read.
+    let text = "MATCH (a:Entity {entity_id:'e0'})-[r1:REL]->(b:Entity)-[r2:REL]->(c:Entity)-[r3:REL]->(d:Entity) \
+        WHERE b.allowed = true AND c.allowed = true AND d.allowed = true \
+        RETURN b.entity_id, c.entity_id, d.entity_id, r1.edge_id, r2.edge_id, r3.edge_id";
+    compare(text, &fixture, true).await;
+    let q = query(text, &fixture, true);
+    q.execute_with_catalog_and_context(fixture.catalog.clone(), SessionContext::new())
+        .await
+        .unwrap();
+    let metrics = q.csr_adjacency_metrics();
+    assert_eq!(
+        metrics
+            .native_multihop_node_index_reads
+            .load(Ordering::Relaxed),
+        1
+    );
+    // An existing ID BTree is preferred over a resident ID map.
+    assert_eq!(
+        metrics
+            .native_multihop_node_take_reads
+            .load(Ordering::Relaxed),
+        0
+    );
+}

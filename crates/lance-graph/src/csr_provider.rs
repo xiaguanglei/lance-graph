@@ -121,6 +121,11 @@ pub struct CsrScanMetrics {
     /// Completed node reads whose executed plan contains a BTree lookup on an
     /// actual node-ID field, rather than merely an index on an ACL property.
     pub native_multihop_node_index_reads: AtomicU64,
+    /// Completed node reads served by `take_rows` through a cached, pinned
+    /// node-ID -> row-ID map instead of a filtered node table scan.
+    pub native_multihop_node_take_reads: AtomicU64,
+    /// Node-ID maps built (cold) for this query; hits are not counted here.
+    pub native_multihop_node_key_builds: AtomicU64,
 }
 
 /// Share only within one caller's security context. Entries retain the exact
@@ -128,6 +133,9 @@ pub struct CsrScanMetrics {
 /// cross-credential reuse. There is deliberately no process-global singleton.
 /// Slots are not evicted: callers should scope this cache to a bounded snapshot
 /// lifetime; subsequent snapshots safely fall back when all slots are occupied.
+/// Native multi-hop also caches pinned node-ID -> row-ID maps (IDs only, never
+/// properties or masks) in separate slots, limited to half of the row/byte
+/// budget; when one does not fit, the filtered node scan is used instead.
 #[derive(Debug)]
 pub struct CsrAdjacencyCache {
     options: CsrScanOptions,
@@ -137,6 +145,11 @@ pub struct CsrAdjacencyCache {
 #[derive(Debug, Default)]
 struct CacheState {
     entries: HashMap<CacheKey, CacheEntry>,
+    // Node-ID maps have their own slots so they never take an adjacency slot,
+    // but share the row/byte budget and may use at most half of it.
+    node_entries: HashMap<CacheKey, NodeKeyEntry>,
+    node_rows: usize,
+    node_bytes: usize,
     rows: usize,
     bytes: usize,
 }
@@ -158,6 +171,38 @@ struct CacheEntry {
     // impossible while a cached key is retained.
     _dataset: Arc<Dataset>,
     snapshot: Option<Arc<AdjacencySnapshot>>,
+}
+
+#[derive(Debug)]
+struct NodeKeyEntry {
+    _dataset: Arc<Dataset>,
+    keys: Option<Arc<NodeKeySnapshot>>,
+}
+
+/// Pinned node-ID -> stable row-ID lookup for one node dataset version. Only
+/// the ID column is cached: properties, ACL masks and parameters are always
+/// read and evaluated per query.
+#[derive(Debug)]
+pub(crate) struct NodeKeySnapshot {
+    _dataset: Arc<Dataset>,
+    keys: HashMap<Endpoint, u32>,
+    // CSR-style grouping: rows of key `k` are `row_ids[offsets[k]..offsets[k + 1]]`.
+    offsets: Vec<u32>,
+    row_ids: Vec<u64>,
+    bytes: usize,
+}
+
+impl NodeKeySnapshot {
+    /// Every physical row whose ID equals `key`, including duplicates.
+    pub(crate) fn rows(&self, key: &Endpoint) -> &[u64] {
+        match self.keys.get(key) {
+            Some(&dense) => {
+                let dense = dense as usize;
+                &self.row_ids[self.offsets[dense] as usize..self.offsets[dense + 1] as usize]
+            }
+            None => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -252,6 +297,172 @@ impl CsrAdjacencyCache {
         );
         snapshot
     }
+
+    /// The node-ID map of `dataset.key`, built once per pinned version. None
+    /// means unsupported or over budget; callers keep their filtered scan.
+    pub(crate) async fn node_keys(
+        &self,
+        dataset: Arc<Dataset>,
+        key: &str,
+        metrics: &CsrScanMetrics,
+    ) -> Option<Arc<NodeKeySnapshot>> {
+        let store = dataset.object_store(None).await.ok()?;
+        let key = CacheKey {
+            uri: dataset.uri().into(),
+            version: dataset.version_id(),
+            manifest: Arc::as_ptr(&dataset.manifest) as usize,
+            session: Arc::as_ptr(&dataset.session()) as usize,
+            store: Arc::as_ptr(&store) as usize,
+            source: key.into(),
+            target: String::new(),
+        };
+        let mut state = self.state.lock().await;
+        if let Some(entry) = state.node_entries.get(&key) {
+            return entry.keys.clone();
+        }
+        if state.node_entries.len() >= self.options.max_cache_slots {
+            return None;
+        }
+        let remaining_rows = self
+            .options
+            .max_cache_rows
+            .saturating_sub(state.rows)
+            .min((self.options.max_cache_rows / 2).saturating_sub(state.node_rows));
+        let remaining_bytes = self
+            .options
+            .max_cache_bytes
+            .saturating_sub(state.bytes)
+            .min((self.options.max_cache_bytes / 2).saturating_sub(state.node_bytes));
+        let keys = build_node_keys(
+            dataset.clone(),
+            &key.source,
+            &self.options,
+            remaining_rows,
+            remaining_bytes,
+        )
+        .await;
+        if let Some(keys) = &keys {
+            let rows = keys.row_ids.len();
+            state.rows += rows;
+            state.bytes += keys.bytes;
+            state.node_rows += rows;
+            state.node_bytes += keys.bytes;
+            metrics
+                .native_multihop_node_key_builds
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        state.node_entries.insert(
+            key,
+            NodeKeyEntry {
+                _dataset: dataset,
+                keys: keys.clone(),
+            },
+        );
+        keys
+    }
+}
+
+async fn build_node_keys(
+    dataset: Arc<Dataset>,
+    key: &str,
+    options: &CsrScanOptions,
+    remaining_rows: usize,
+    remaining_bytes: usize,
+) -> Option<Arc<NodeKeySnapshot>> {
+    let field = dataset.schema().field(key)?;
+    if !matches!(field.data_type(), DataType::Utf8 | DataType::UInt64) {
+        return None;
+    }
+    let expected_rows = dataset.count_rows(None).await.ok()?;
+    if expected_rows > options.max_vertices
+        || expected_rows > remaining_rows
+        || expected_rows > u32::MAX as usize
+    {
+        return None;
+    }
+    let budget = remaining_bytes.min(options.max_bytes);
+    // Per row: (dense, row id) scratch plus the final row-ID array. Per key:
+    // hash entry, owned text and offset. Conservative, not an RSS ceiling.
+    let row_bytes = expected_rows.checked_mul(24)?;
+    let estimate = |keys: usize, text: usize, batch: usize| {
+        row_bytes
+            .checked_add(keys.checked_mul(96)?)?
+            .checked_add(text)?
+            .checked_add(batch)
+    };
+    if estimate(0, 0, 0)? > budget {
+        return None;
+    }
+    let mut keys: HashMap<Endpoint, u32> = HashMap::new();
+    let mut pairs: Vec<(u32, u64)> = Vec::with_capacity(expected_rows);
+    let mut text_bytes = 0usize;
+    let mut max_batch_bytes = 0usize;
+    let mut scanner = dataset.scan();
+    scanner.project(&[key]).ok()?;
+    scanner.with_row_id().batch_size(8192);
+    let mut batches = scanner.try_into_stream().await.ok()?;
+    while let Some(batch) = batches.try_next().await.ok()? {
+        max_batch_bytes = max_batch_bytes.max(batch.get_array_memory_size());
+        let values = batch.column_by_name(key)?;
+        let ids = batch
+            .column_by_name("_rowid")?
+            .as_any()
+            .downcast_ref::<UInt64Array>()?;
+        for row in 0..batch.num_rows() {
+            if ids.is_null(row) || pairs.len() >= expected_rows {
+                return None;
+            }
+            // A NULL ID never equals a bound key; the row cannot be selected.
+            let Some(value) = array_endpoint(values.as_ref(), row) else {
+                if values.is_null(row) {
+                    continue;
+                }
+                return None;
+            };
+            let dense = match keys.get(&value) {
+                Some(dense) => *dense,
+                None => {
+                    if let Endpoint::Text(text) = &value {
+                        text_bytes = text_bytes.checked_add(text.len())?;
+                    }
+                    if estimate(keys.len() + 1, text_bytes, max_batch_bytes)? > budget {
+                        return None;
+                    }
+                    let dense = u32::try_from(keys.len()).ok()?;
+                    keys.insert(value, dense);
+                    dense
+                }
+            };
+            pairs.push((dense, ids.value(row)));
+        }
+    }
+    let bytes = estimate(keys.len(), text_bytes, max_batch_bytes)?;
+    if bytes > budget {
+        return None;
+    }
+    // Counting sort keeps the physical order of duplicate IDs.
+    let mut offsets = vec![0u32; keys.len() + 1];
+    for (dense, _) in &pairs {
+        offsets[*dense as usize + 1] += 1;
+    }
+    for index in 1..offsets.len() {
+        offsets[index] += offsets[index - 1];
+    }
+    let mut next = offsets.clone();
+    let mut row_ids = vec![0u64; pairs.len()];
+    for (dense, row_id) in pairs {
+        let slot = &mut next[dense as usize];
+        row_ids[*slot as usize] = row_id;
+        *slot += 1;
+    }
+    keys.shrink_to_fit();
+    Some(Arc::new(NodeKeySnapshot {
+        _dataset: dataset,
+        keys,
+        offsets,
+        row_ids,
+        bytes,
+    }))
 }
 
 pub(crate) fn array_endpoint(array: &dyn Array, row: usize) -> Option<Endpoint> {
@@ -288,9 +499,20 @@ async fn build_snapshot(
     if edge_bytes > budget {
         return None;
     }
-    let mut vertices = HashMap::new();
+    let mut vertices: HashMap<Endpoint, u64> = HashMap::new();
+    // Reverse identity belongs to the same pinned topology and is filled while
+    // interning; its retained size is part of every incremental estimate.
+    let mut endpoints: Vec<Endpoint> = Vec::new();
     let mut text_bytes = 0usize;
     let mut max_batch_bytes = 0usize;
+    // Builder scratch for both directions plus retained hash map and reverse
+    // vector. Conservative estimates, not a hard allocator/RSS ceiling.
+    let estimate = |vertices: usize, text_bytes: usize, max_batch_bytes: usize| {
+        edge_bytes
+            .checked_add(vertices.checked_mul(192 + std::mem::size_of::<Endpoint>())?)?
+            .checked_add(text_bytes.checked_mul(3)?)?
+            .checked_add(max_batch_bytes)
+    };
     let mut outgoing = CsrIndexBuilder::new();
     let mut incoming = CsrIndexBuilder::new();
     let mut rows = 0usize;
@@ -300,12 +522,7 @@ async fn build_snapshot(
     let mut batches = scanner.try_into_stream().await.ok()?;
     while let Some(batch) = batches.try_next().await.ok()? {
         max_batch_bytes = max_batch_bytes.max(batch.get_array_memory_size());
-        if edge_bytes
-            .checked_add(vertices.len().checked_mul(192)?)?
-            .checked_add(text_bytes.checked_mul(2)?)?
-            .checked_add(max_batch_bytes)?
-            > budget
-        {
+        if estimate(vertices.len(), text_bytes, max_batch_bytes)? > budget {
             return None;
         }
         let sources = batch.column_by_name(source)?;
@@ -318,33 +535,36 @@ async fn build_snapshot(
             if ids.is_null(row) || rows >= expected_rows {
                 return None;
             }
-            let mut endpoints = [0u64; 2];
+            let mut dense = [0u64; 2];
             for (slot, array) in [sources, targets].into_iter().enumerate() {
                 let value = array_endpoint(array.as_ref(), row)?;
-                if !vertices.contains_key(&value) {
-                    if vertices.len() >= options.max_vertices {
-                        return None;
+                dense[slot] = match vertices.get(&value) {
+                    Some(id) => *id,
+                    None => {
+                        if vertices.len() >= options.max_vertices {
+                            return None;
+                        }
+                        if let Endpoint::Text(text) = &value {
+                            text_bytes = text_bytes.checked_add(text.len())?;
+                        }
+                        if estimate(vertices.len().checked_add(1)?, text_bytes, max_batch_bytes)?
+                            > budget
+                        {
+                            return None;
+                        }
+                        let id = vertices.len() as u64;
+                        endpoints.push(value.clone());
+                        vertices.insert(value, id);
+                        id
                     }
-                    if let Endpoint::Text(text) = &value {
-                        text_bytes = text_bytes.checked_add(text.len())?;
-                    }
-                    let bytes = edge_bytes
-                        .checked_add(vertices.len().checked_add(1)?.checked_mul(192)?)?
-                        .checked_add(text_bytes.checked_mul(2)?)?
-                        .checked_add(max_batch_bytes)?;
-                    if bytes > budget {
-                        return None;
-                    }
-                    vertices.insert(value.clone(), vertices.len() as u64);
-                }
-                endpoints[slot] = *vertices.get(&value)?;
+                };
             }
             // Stable storage row IDs, never input ordinals or CSR array positions.
             outgoing = outgoing
-                .try_add_edge_with_id(ids.value(row), endpoints[0], endpoints[1])
+                .try_add_edge_with_id(ids.value(row), dense[0], dense[1])
                 .ok()?;
             incoming = incoming
-                .try_add_edge_with_id(ids.value(row), endpoints[1], endpoints[0])
+                .try_add_edge_with_id(ids.value(row), dense[1], dense[0])
                 .ok()?;
             rows += 1;
         }
@@ -352,26 +572,11 @@ async fn build_snapshot(
     if rows != expected_rows {
         return None;
     }
-    let base_bytes = edge_bytes
-        .checked_add(vertices.len().checked_mul(192)?)?
-        .checked_add(text_bytes.checked_mul(2)?)?
-        .checked_add(max_batch_bytes)?;
-    // One exact-size reverse vector plus cloned strings is allocated only
-    // after its construction/retained estimate fits the same cache budget.
-    // The existing builder estimate remains conservative rather than being
-    // silently reduced to make a larger topology pass.
-    let reverse_bytes = vertices
-        .len()
-        .checked_mul(std::mem::size_of::<Endpoint>())?
-        .checked_add(text_bytes)?;
-    let bytes = base_bytes.checked_add(reverse_bytes)?;
+    let bytes = estimate(vertices.len(), text_bytes, max_batch_bytes)?;
     if bytes > budget {
         return None;
     }
-    let mut endpoints = vec![Endpoint::Number(0); vertices.len()];
-    for (key, id) in &vertices {
-        *endpoints.get_mut(*id as usize)? = key.clone();
-    }
+    endpoints.shrink_to_fit();
     Some(Arc::new(AdjacencySnapshot {
         _dataset: dataset,
         outgoing: outgoing
@@ -657,7 +862,7 @@ fn exact_csr_output(
 
 // Metadata admission is exact and pinned; execution coverage, append fragments
 // and deletion masks remain the native Lance scanner's responsibility.
-async fn endpoint_btrees(
+pub(crate) async fn endpoint_btrees(
     dataset: &Dataset,
     source: &str,
     target: &str,

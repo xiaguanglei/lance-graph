@@ -259,7 +259,7 @@ async fn main() {
             println!("cold n={n} query={name} ms={:.3} builds={} rows={}", start.elapsed().as_secs_f64()*1000., cold.csr_adjacency_metrics().build_count.load(Ordering::Relaxed), first.num_rows());
             for (arm, native) in [("old1", false), ("native", true), ("old2", false)] {
                 for _ in 0..5 { make(native).execute_with_catalog_and_context(catalog.clone(), SessionContext::new()).await.unwrap(); }
-                let mut samples = Vec::new(); let mut inputs = 0; let mut bytes = 0; let mut checks = 0; let mut index_reads = 0;
+                let mut samples = Vec::new(); let mut inputs = 0; let mut bytes = 0; let mut checks = 0; let mut index_reads = 0; let mut take_reads = 0;
                 for _ in 0..20 {
                     let start = Instant::now(); let q = make(native);
                     let result = q.execute_with_catalog_and_context(catalog.clone(), SessionContext::new()).await.unwrap();
@@ -269,12 +269,12 @@ async fn main() {
                     assert_eq!(metrics.native_multihop_executions.load(Ordering::Relaxed), u64::from(native));
                     assert_eq!(metrics.native_multihop_fallbacks.load(Ordering::Relaxed), 0);
                     if native && indexed { assert!(metrics.native_multihop_node_index_reads.load(Ordering::Relaxed) >= 1); }
-                    index_reads += metrics.native_multihop_node_index_reads.load(Ordering::Relaxed);
+                    index_reads += metrics.native_multihop_node_index_reads.load(Ordering::Relaxed); take_reads += metrics.native_multihop_node_take_reads.load(Ordering::Relaxed);
                     inputs += metrics.native_multihop_input_rows.load(Ordering::Relaxed); bytes += metrics.native_multihop_input_bytes.load(Ordering::Relaxed); checks += metrics.native_multihop_edge_checks.load(Ordering::Relaxed);
                 }
                 let raw = samples.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(",");
                 samples.sort_by(f64::total_cmp);
-                println!("hot n={n} query={name} arm={arm} p50_ms={:.3} p95_ms={:.3} rows={} native={} fallback=0 input_rows_avg={} arrow_bytes_avg={} edge_checks_avg={} node_id_btree_reads_avg={} raw_ms=[{raw}]", (samples[9]+samples[10])/2., samples[18], baseline.num_rows(), native, inputs / 20, bytes / 20, checks / 20, index_reads / 20);
+                println!("hot n={n} query={name} arm={arm} p50_ms={:.3} p95_ms={:.3} rows={} native={} fallback=0 input_rows_avg={} arrow_bytes_avg={} edge_checks_avg={} node_id_btree_reads_avg={} node_id_take_reads_avg={} raw_ms=[{raw}]", (samples[9]+samples[10])/2., samples[18], baseline.num_rows(), native, inputs / 20, bytes / 20, checks / 20, index_reads / 20, take_reads / 20);
             }
         }
     }

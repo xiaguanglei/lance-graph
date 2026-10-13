@@ -5,7 +5,8 @@ use super::{PathSpec, Slice};
 use crate::{
     case_insensitive::qualify_column,
     csr_provider::{
-        array_endpoint, endpoint_btree_plan, AdjacencySnapshot, CsrScanMetrics, Endpoint,
+        array_endpoint, endpoint_btree_plan, endpoint_btrees, underlying_lance, AdjacencySnapshot,
+        CsrScanMetrics, Endpoint,
     },
     csr_walk::{csr_walk_steps_filtered, CsrWalkOptions},
 };
@@ -143,8 +144,9 @@ fn required(spec: &PathSpec, projection: &[usize]) -> Option<Vec<BTreeSet<String
 fn union_filter<'a>(
     slices: impl Iterator<Item = (&'a Slice, &'a BTreeSet<Endpoint>)>,
 ) -> Result<Vec<Expr>> {
+    let slices = slices.collect::<Vec<_>>();
     let mut predicates = Vec::new();
-    for (slice, candidates) in slices {
+    for (slice, candidates) in &slices {
         let predicate = slice
             .filters
             .iter()
@@ -164,20 +166,35 @@ fn union_filter<'a>(
                 })
             })?
             .data;
-        let keys = candidates
+        predicates.push(predicate.and(endpoint_list(&slice.key, candidates)));
+    }
+    let Some(union) = predicates.into_iter().reduce(Expr::or) else {
+        return Ok(Vec::new());
+    };
+    // Several aliases of one table give `(k IN A AND p) OR (k IN B AND q)`,
+    // which a scalar index cannot answer. The redundant necessary conjunct
+    // `k IN A∪B` lets Lance use a node-ID BTree and refine with the OR.
+    let key = &slices[0].0.key;
+    if slices.len() > 1 && slices.iter().all(|(slice, _)| &slice.key == key) {
+        let all = slices
             .iter()
+            .flat_map(|(_, candidates)| candidates.iter().cloned())
+            .collect();
+        return Ok(vec![endpoint_list(key, &all).and(union)]);
+    }
+    Ok(vec![union])
+}
+
+fn endpoint_list(key: &str, keys: &BTreeSet<Endpoint>) -> Expr {
+    col(key).in_list(
+        keys.iter()
             .map(|key| match key {
                 Endpoint::Text(value) => lit(value.clone()),
                 Endpoint::Number(value) => lit(*value),
             })
-            .collect();
-        predicates.push(predicate.and(col(&slice.key).in_list(keys, false)));
-    }
-    Ok(predicates
-        .into_iter()
-        .reduce(Expr::or)
-        .into_iter()
-        .collect())
+            .collect(),
+        false,
+    )
 }
 
 // A necessary reachable superset, not the final result. Unique per-level
@@ -324,6 +341,101 @@ async fn read(
     Ok(Some(batch))
 }
 
+enum NodeRead {
+    Rows(RecordBatch),
+    /// Not applicable here; the filtered provider scan remains.
+    Scan,
+    /// A resource guard was hit; replay the legacy plan.
+    Reject,
+}
+
+// Reachable node IDs are known exactly, so a pinned ID -> row-ID map turns the
+// O(table) filtered scan into a take of just those rows. All rows of every
+// candidate ID are taken; per-alias masks are evaluated afterwards exactly as
+// for scanned rows. An existing node-ID BTree is used through the scan instead.
+async fn take_nodes(
+    spec: &PathSpec,
+    provider: &Arc<dyn datafusion::datasource::TableProvider>,
+    columns: &BTreeSet<String>,
+    slots: &[usize],
+    candidates: &[BTreeSet<Endpoint>],
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<NodeRead> {
+    let Some(lance) = underlying_lance(provider) else {
+        return Ok(NodeRead::Scan);
+    };
+    let key = &spec.slices[slots[0]].key;
+    if slots.iter().any(|slot| &spec.slices[*slot].key != key) {
+        return Ok(NodeRead::Scan);
+    }
+    let dataset = lance.dataset();
+    if endpoint_btrees(&dataset, key, key)
+        .await
+        .is_none_or(|indexed| indexed.contains(key))
+    {
+        return Ok(NodeRead::Scan);
+    }
+    // Only plain stored columns: system or provider-converted fields keep the
+    // scan so the Arrow contract stays identical.
+    let provider_schema = provider.schema();
+    let dataset_schema = Schema::from(dataset.schema());
+    if columns.iter().any(|name| {
+        name.starts_with('_')
+            || provider_schema.field_with_name(name).ok()
+                != dataset_schema.field_with_name(name).ok()
+    }) {
+        return Ok(NodeRead::Scan);
+    }
+    let Some(keys) = spec
+        .cache
+        .node_keys(dataset.clone(), key, &spec.metrics)
+        .await
+    else {
+        return Ok(NodeRead::Scan);
+    };
+    let mut rows = Vec::new();
+    for slot in slots {
+        for id in &candidates[*slot / 2] {
+            rows.extend_from_slice(keys.rows(id));
+            if rows.len() > max_rows.saturating_mul(slots.len()) {
+                return Ok(NodeRead::Reject);
+            }
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.len() > max_rows || rows.len() > u32::MAX as usize {
+        return Ok(NodeRead::Reject);
+    }
+    let names = columns.iter().map(String::as_str).collect::<Vec<_>>();
+    let projection = dataset
+        .schema()
+        .project(&names)
+        .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
+    let batch = if rows.is_empty() {
+        RecordBatch::new_empty(Arc::new(Schema::from(&projection)))
+    } else {
+        dataset
+            .take_rows(&rows, ProjectionRequest::Schema(Arc::new(projection)))
+            .await
+            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?
+    };
+    spec.metrics
+        .native_multihop_input_rows
+        .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+    spec.metrics
+        .native_multihop_input_bytes
+        .fetch_add(batch.get_array_memory_size() as u64, Ordering::Relaxed);
+    if batch.num_rows() != rows.len() || batch.get_array_memory_size() > max_bytes {
+        return Ok(NodeRead::Reject);
+    }
+    spec.metrics
+        .native_multihop_node_take_reads
+        .fetch_add(1, Ordering::Relaxed);
+    Ok(NodeRead::Rows(batch))
+}
+
 fn mask(slice: &Slice, batch: &RecordBatch, state: &SessionState) -> Result<Vec<bool>> {
     let fields = batch
         .schema()
@@ -454,21 +566,6 @@ pub(super) async fn execute(
     for slot in (1..requirements.len()).step_by(2) {
         columns.extend(requirements[slot].iter().cloned());
     }
-    let Some(edge_batch) = edge_rows(spec, &reachable_edges, &columns).await? else {
-        return Ok(None);
-    };
-    let Some(ids) = edge_batch
-        .column_by_name("_rowid")
-        .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
-    else {
-        return Ok(None);
-    };
-    let mut edge_positions = HashMap::new();
-    for row in 0..edge_batch.num_rows() {
-        if ids.is_null(row) || edge_positions.insert(ids.value(row), row as u32).is_some() {
-            return Ok(None);
-        }
-    }
     // Query-local raw node batches may be reused, but masks and alias bindings
     // are always recomputed. No identity/ACL/parameter mask enters the CSR cache.
     let mut node_groups: HashMap<
@@ -488,28 +585,70 @@ pub(super) async fn execute(
         group.1.extend(requirements[slot].iter().cloned());
         group.2.push(slot);
     }
+    // Candidates come from the snapshot alone, so the edge read and every
+    // node read are independent: issue them concurrently. Each read keeps the
+    // full byte guard and their sum is checked before any mask or output.
+    let node_candidates = &node_candidates;
+    let node_reads = futures::future::try_join_all(node_groups.into_iter().map(
+        |(key, (provider, columns, slots))| async move {
+            let batch = match take_nodes(
+                spec,
+                &provider,
+                &columns,
+                &slots,
+                node_candidates,
+                options.max_vertices,
+                options.max_bytes,
+            )
+            .await?
+            {
+                NodeRead::Rows(batch) => Some(batch),
+                NodeRead::Reject => None,
+                NodeRead::Scan => {
+                    read(
+                        &provider,
+                        state,
+                        &columns,
+                        &union_filter(
+                            slots
+                                .iter()
+                                .map(|slot| (&spec.slices[*slot], &node_candidates[*slot / 2])),
+                        )?,
+                        &slots
+                            .iter()
+                            .map(|slot| spec.slices[*slot].key.clone())
+                            .collect(),
+                        &spec.metrics,
+                        options.max_vertices,
+                        options.max_bytes,
+                    )
+                    .await?
+                }
+            };
+            Ok::<_, datafusion::common::DataFusionError>(batch.map(|batch| (key, batch)))
+        },
+    ));
+    let (edge_batch, node_reads) =
+        futures::future::try_join(edge_rows(spec, &reachable_edges, &columns), node_reads).await?;
+    let Some(edge_batch) = edge_batch else {
+        return Ok(None);
+    };
+    let Some(ids) = edge_batch
+        .column_by_name("_rowid")
+        .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+    else {
+        return Ok(None);
+    };
+    let mut edge_positions = HashMap::new();
+    for row in 0..edge_batch.num_rows() {
+        if ids.is_null(row) || edge_positions.insert(ids.value(row), row as u32).is_some() {
+            return Ok(None);
+        }
+    }
     let mut node_batches = HashMap::new();
     let mut input_bytes = edge_batch.get_array_memory_size();
-    for (key, (provider, columns, slots)) in node_groups {
-        let Some(batch) = read(
-            &provider,
-            state,
-            &columns,
-            &union_filter(
-                slots
-                    .iter()
-                    .map(|slot| (&spec.slices[*slot], &node_candidates[*slot / 2])),
-            )?,
-            &slots
-                .iter()
-                .map(|slot| spec.slices[*slot].key.clone())
-                .collect(),
-            &spec.metrics,
-            options.max_vertices,
-            options.max_bytes.saturating_sub(input_bytes),
-        )
-        .await?
-        else {
+    for read in node_reads {
+        let Some((key, batch)) = read else {
             return Ok(None);
         };
         input_bytes = input_bytes.saturating_add(batch.get_array_memory_size());
