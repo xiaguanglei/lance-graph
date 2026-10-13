@@ -156,6 +156,13 @@ let query = CypherQuery::new(text)?.with_config(config).with_shared_csr_cache(ca
   entries. `cache.stats()` reports usage, full/incremental builds, evictions
   and rejected builds; `query.csr_adjacency_metrics()` reports per-query
   native executions, fallbacks, builds and build time.
+- Multi-node services should read through `GraphSnapshotProvider` (one per
+  node and security context): it pins every table to one version per query,
+  serves read-your-writes via `GraphVersions` tokens (`at_least`) and exact
+  reads (`at`), and owns the node's shared cache. Use
+  `CypherQuery::with_deterministic_order(true)` for paginated or limited
+  results. See `docs/multi_node_deployment.md` for the full server-side
+  protocol (write order, staleness, retention, monitoring).
 
 A builder (`CypherQueryBuilder`) is also available for constructing queries programmatically without parsing text.
 
