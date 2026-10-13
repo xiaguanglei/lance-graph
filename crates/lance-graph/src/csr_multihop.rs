@@ -22,7 +22,7 @@ use crate::{
     logical_plan::LogicalOperator,
     CsrAdjacencyCache, CsrScanMetrics,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -32,7 +32,7 @@ use datafusion::{
     },
     datasource::{source_as_provider, DefaultTableSource, MemTable, TableProvider},
     execution::{SessionState, TaskContext},
-    logical_expr::{col, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType},
+    logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder, TableSource, TableType},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         coalesce_partitions::CoalescePartitionsExec,
@@ -227,10 +227,20 @@ fn slice(
         ) {
             return Ok(None);
         }
+        // A non-negative integer against a UInt64 column is the same equality
+        // without the coercion cast that would make this mandatory mask unsafe.
+        let unsigned = match value {
+            PropertyValue::Integer(number) if *number >= 0 => provider
+                .schema()
+                .field_with_name(name)
+                .is_ok_and(|field| field.data_type() == &DataType::UInt64)
+                .then(|| lit(*number as u64)),
+            _ => None,
+        };
         filters.push(
-            col(qualify_column(alias, name)).eq(expression::to_df_value_expr(
-                &crate::ast::ValueExpression::Literal(value.clone()),
-            )),
+            col(qualify_column(alias, name)).eq(unsigned.unwrap_or_else(|| {
+                expression::to_df_value_expr(&crate::ast::ValueExpression::Literal(value.clone()))
+            })),
         );
     }
     let mandatory_filters = filters.len();

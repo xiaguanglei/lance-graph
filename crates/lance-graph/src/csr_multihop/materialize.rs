@@ -191,6 +191,7 @@ fn endpoint_list(key: &str, keys: &BTreeSet<Endpoint>) -> Expr {
             .map(|key| match key {
                 Endpoint::Text(value) => lit(value.clone()),
                 Endpoint::Number(value) => lit(*value),
+                Endpoint::Signed(value) => lit(*value),
             })
             .collect(),
         false,

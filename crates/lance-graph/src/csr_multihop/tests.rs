@@ -1095,3 +1095,140 @@ async fn unseeded_or_target_bound_single_hop_keeps_join_plan() {
         assert!(result.num_rows() > 0, "{text}");
     }
 }
+
+/// A Person/KNOWS graph keyed by `datatype` (Int64 or UInt64), with negative
+/// keys for Int64, a duplicate node row and a cycle.
+async fn numeric_fixture(datatype: DataType) -> Fixture {
+    use arrow_array::{Int64Array, UInt64Array};
+    let temp = tempfile::tempdir().unwrap();
+    let signed = datatype == DataType::Int64;
+    let key = |value: i64| if signed { value - 3 } else { value };
+    let ids = |values: Vec<i64>| -> Arc<dyn Array> {
+        if signed {
+            Arc::new(Int64Array::from(
+                values.into_iter().map(key).collect::<Vec<_>>(),
+            ))
+        } else {
+            Arc::new(UInt64Array::from(
+                values.into_iter().map(|v| v as u64).collect::<Vec<_>>(),
+            ))
+        }
+    };
+    let n = 12_i64;
+    let mut people: Vec<i64> = (0..n).collect();
+    let mut ages: Vec<i64> = (0..n).map(|i| 18 + (i * 7) % 40).collect();
+    people.push(4); // duplicate node row
+    ages.push(99);
+    let persons = write(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("person_id", datatype.clone(), false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("age", DataType::Int64, false),
+            ])),
+            vec![
+                ids(people.clone()),
+                Arc::new(StringArray::from(
+                    people
+                        .iter()
+                        .zip(&ages)
+                        .map(|(p, a)| format!("p{p}_{a}"))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow_array::Int64Array::from(ages)),
+            ],
+        )
+        .unwrap(),
+        &temp.path().join("persons.lance"),
+    )
+    .await;
+    let mut pairs: Vec<(i64, i64)> = (0..n)
+        .flat_map(|i| [(i, (i + 1) % n), (i, (i + 5) % n)])
+        .collect();
+    pairs.push((2, 2)); // self loop
+    pairs.push((1, 2)); // parallel edge
+    let edges = write(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("src", datatype.clone(), false),
+                Field::new("dst", datatype.clone(), false),
+                Field::new("weight", DataType::Int64, false),
+            ])),
+            vec![
+                ids(pairs.iter().map(|p| p.0).collect()),
+                ids(pairs.iter().map(|p| p.1).collect()),
+                Arc::new(arrow_array::Int64Array::from(
+                    (0..pairs.len() as i64).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap(),
+        &temp.path().join("knows.lance"),
+    )
+    .await;
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "person_id")
+        .with_relationship("KNOWS", "src", "dst")
+        .build()
+        .unwrap();
+    let catalog = Arc::new(
+        InMemoryCatalog::new()
+            .with_node_source(
+                "Person",
+                Arc::new(DefaultTableSource::new(Arc::new(LanceTableProvider::new(
+                    persons, false, false,
+                )))),
+            )
+            .with_relationship_source(
+                "KNOWS",
+                Arc::new(DefaultTableSource::new(Arc::new(LanceTableProvider::new(
+                    edges.clone(),
+                    false,
+                    false,
+                )))),
+            ),
+    );
+    Fixture {
+        _temp: temp,
+        config,
+        catalog,
+        edges,
+        cache: Arc::new(CsrAdjacencyCache::new(crate::CsrScanOptions::default())),
+    }
+}
+
+#[tokio::test]
+async fn integer_keys_run_natively_for_one_to_three_hops() {
+    for datatype in [DataType::Int64, DataType::UInt64] {
+        let fixture = numeric_fixture(datatype.clone()).await;
+        // Int64 keys are shifted by -3: logical node 1 is -2, node 4 is 1.
+        let (one, four, two) = if datatype == DataType::Int64 {
+            ("-2", "1", "-1")
+        } else {
+            ("1", "4", "2")
+        };
+        let queries = [
+            format!(
+                "MATCH (a:Person {{person_id: {one}}})-[k:KNOWS]->(b:Person) \
+                 RETURN b.person_id, b.name, k.weight"
+            ),
+            format!(
+                "MATCH (a:Person)<-[k:KNOWS]-(b:Person) WHERE a.person_id = {two} \
+                 RETURN b.person_id, b.name, k.weight"
+            ),
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) \
+                 WHERE a.person_id IN [{one}, {four}] AND c.age > 30 \
+                 RETURN a.person_id, b.name, c.name"
+            ),
+            format!(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(d:Person) \
+                 WHERE a.person_id = {two} RETURN b.person_id, c.person_id, d.name"
+            ),
+        ];
+        for text in &queries {
+            let result = compare(text, &fixture, true).await;
+            assert!(result.num_rows() > 0, "{datatype} {text}");
+        }
+    }
+}

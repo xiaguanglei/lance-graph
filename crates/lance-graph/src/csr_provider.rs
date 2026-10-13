@@ -8,7 +8,7 @@
 //! No global cache, persistent sidecar, business rules, or BFS/path rewrite.
 
 use crate::{csr_walk::AdjacencyView, GraphConfig};
-use arrow_array::{Array, RecordBatch, RecordBatchOptions, StringArray, UInt64Array};
+use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray, UInt64Array};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -157,19 +157,31 @@ pub struct CsrScanMetrics {
 pub(crate) enum Endpoint {
     Text(String),
     Number(u64),
+    /// Int64 keys. Every hop requires identical key types, so values never
+    /// meet `Number` keys.
+    Signed(i64),
+}
+
+/// Node and edge key types the CSR paths index.
+pub(crate) fn endpoint_type(datatype: &DataType) -> bool {
+    matches!(
+        datatype,
+        DataType::Utf8 | DataType::UInt64 | DataType::Int64
+    )
 }
 
 pub(crate) fn array_endpoint(array: &dyn Array, row: usize) -> Option<Endpoint> {
     if array.is_null(row) {
         return None;
     }
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+    let any = array.as_any();
+    if let Some(array) = any.downcast_ref::<StringArray>() {
         Some(Endpoint::Text(array.value(row).into()))
+    } else if let Some(array) = any.downcast_ref::<UInt64Array>() {
+        Some(Endpoint::Number(array.value(row)))
     } else {
-        array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map(|array| Endpoint::Number(array.value(row)))
+        any.downcast_ref::<Int64Array>()
+            .map(|array| Endpoint::Signed(array.value(row)))
     }
 }
 
@@ -179,6 +191,10 @@ fn scalar_endpoint(value: &ScalarValue, datatype: &DataType) -> Option<Endpoint>
         (ScalarValue::UInt64(Some(value)), DataType::UInt64) => Some(Endpoint::Number(*value)),
         (ScalarValue::Int64(Some(value)), DataType::UInt64) => {
             u64::try_from(*value).ok().map(Endpoint::Number)
+        }
+        (ScalarValue::Int64(Some(value)), DataType::Int64) => Some(Endpoint::Signed(*value)),
+        (ScalarValue::UInt64(Some(value)), DataType::Int64) => {
+            i64::try_from(*value).ok().map(Endpoint::Signed)
         }
         _ => None,
     }
@@ -510,7 +526,7 @@ fn runtime_membership(
             let key = scalar_endpoint(literal.value(), datatype)?;
             bytes = bytes.checked_add(match &key {
                 Endpoint::Text(text) => text.len(),
-                Endpoint::Number(_) => 8,
+                Endpoint::Number(_) | Endpoint::Signed(_) => 8,
             })?;
             if bytes > 128 * 1024 {
                 return None;
@@ -526,6 +542,7 @@ fn endpoint_predicate(name: &str, keys: &BTreeSet<Endpoint>) -> Expr {
             .map(|key| match key {
                 Endpoint::Text(text) => lit(text.clone()),
                 Endpoint::Number(value) => lit(*value),
+                Endpoint::Signed(value) => lit(*value),
             })
             .collect(),
         false,
@@ -689,7 +706,7 @@ impl TableProvider for CsrRelationshipProvider {
         ) {
             (Ok(actual), Ok(raw)) => {
                 actual == raw
-                    && matches!(actual.data_type(), DataType::Utf8 | DataType::UInt64)
+                    && endpoint_type(actual.data_type())
                     && !actual.metadata().contains_key("ARROW:extension:name")
             }
             _ => false,
@@ -704,7 +721,7 @@ impl TableProvider for CsrRelationshipProvider {
         }
         let bound = |field: &str| -> Option<BTreeSet<Endpoint>> {
             let datatype = schema.field_with_name(field).ok()?.data_type();
-            if !matches!(datatype, DataType::Utf8 | DataType::UInt64) {
+            if !endpoint_type(datatype) {
                 return None;
             }
             filters.iter().fold(None, |keys, filter| {
@@ -1615,6 +1632,16 @@ mod tests {
             Some(BTreeSet::from([Endpoint::Number(7), Endpoint::Number(9)]))
         );
         assert!(scalar_endpoint(&ScalarValue::Int64(Some(-1)), &DataType::UInt64).is_none());
+        assert_eq!(
+            scalar_endpoint(&ScalarValue::Int64(Some(-1)), &DataType::Int64),
+            Some(Endpoint::Signed(-1))
+        );
+        assert_eq!(
+            scalar_endpoint(&ScalarValue::UInt64(Some(7)), &DataType::Int64),
+            Some(Endpoint::Signed(7))
+        );
+        assert!(scalar_endpoint(&ScalarValue::UInt64(Some(u64::MAX)), &DataType::Int64).is_none());
+        assert!(scalar_endpoint(&ScalarValue::Int32(Some(7)), &DataType::Int64).is_none());
         let null: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Utf8(None)));
         let disjunction: Arc<dyn PhysicalExpr> =
             Arc::new(BinaryExpr::new(keys.clone(), Operator::Or, null.clone()));

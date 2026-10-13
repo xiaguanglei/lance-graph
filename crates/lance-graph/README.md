@@ -124,7 +124,8 @@ This does not enable the CSR foundation or the Lance Native executor.
 
 Seeded fixed paths of one to three hops over Lance tables
 (`MATCH (a:Entity {id:'x'})-[:REL]->(b) ...`, `WHERE a.id IN [...]`) run as a
-single CSR traversal instead of per-hop JOINs; every other shape, and any path
+single CSR traversal instead of per-hop JOINs when the node and edge key
+columns share one type (`Utf8`, `Int64` or `UInt64`); every other shape, and any path
 whose topology does not fit the limits, plans the ordinary JOINs. Results are
 identical either way. Share one cache per caller security context so snapshots
 are reused across queries:

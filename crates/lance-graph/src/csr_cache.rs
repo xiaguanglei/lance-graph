@@ -28,7 +28,7 @@ use crate::{
     CsrIndexBuilder,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::Schema;
 use futures::TryStreamExt;
 use lance::{table::format::Fragment, Dataset};
 use std::{
@@ -292,7 +292,7 @@ fn field_ids(dataset: &Dataset, names: &[&str]) -> Option<Vec<i32>> {
 fn text_cost(endpoint: &Endpoint) -> usize {
     match endpoint {
         Endpoint::Text(text) => 2 * (text.len() + TEXT_OVERHEAD),
-        Endpoint::Number(_) => 0,
+        Endpoint::Number(_) | Endpoint::Signed(_) => 0,
     }
 }
 
@@ -1398,7 +1398,7 @@ impl CsrAdjacencyCache {
         let Some(field) = dataset.schema().field(key_field) else {
             return self.rejected();
         };
-        if !matches!(field.data_type(), DataType::Utf8 | DataType::UInt64) {
+        if !crate::csr_provider::endpoint_type(&field.data_type()) {
             return self.rejected();
         }
         let row_addresses = !dataset.manifest().uses_stable_row_ids();
@@ -1782,7 +1782,7 @@ async fn build_node_base(
 mod tests_support {
     use super::*;
     use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
     use lance::dataset::{WriteMode, WriteParams};
 
     pub(super) fn options() -> CsrScanOptions {
