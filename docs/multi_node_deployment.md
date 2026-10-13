@@ -33,6 +33,7 @@ let cache = Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
     max_cache_bytes: 2 << 30,    // 本节点所有缓存版本，约 32 B/边 + 顶点
     max_cache_rows: 20_000_000,
     max_cache_slots: 32,
+    max_column_cache_bytes: 512 << 20, // 属性列缓存（可选，默认 0 关闭），热查询延迟约减半
     ..Default::default()
 }));
 let provider = GraphSnapshotProvider::new(namespace, graph_config)
@@ -49,6 +50,17 @@ let report = snapshot.warm().await;   // report.skipped > 0 表示有表放不�
 内存估算（每个节点各自一份）：边约 32 B/条常驻，顶点约 160 B/个加上 ID 字符串长度的两倍，
 节点 ID 映射约 24 B/行 + 96 B/个不同 ID。多个版本共享同一个底座时只计一次，增量部分很小。
 例：80 万边 + 两张 20 万行节点表约 170 MB。
+
+属性列缓存（`max_column_cache_bytes`）：Lance 本身没有数据页缓存，原生遍历每次都要从存储读取
+返回列和过滤列。开启后这些列按 fragment、按版本缓存在内存中，未变化的 fragment 在新旧版本间共享，
+预算与拓扑缓存独立，放不下时回退为直接读存储（结果不变）。大小约等于被查询列的 Arrow 内存大小
+（字符串列 ≈ 总字节数 + 4 B/行）。本地 20 万节点基准中，热查询 p50 从约 2.3–2.8 ms 降到约 1.0–1.6 ms。
+可在预热时调用 `cache.warm_columns(dataset, &["memory_id", "content", ...])` 预先加载，
+否则在第一次查询时按需加载。
+
+本地延迟基准（生产读路径：provider + `execute_with_snapshot`，并与 JOIN 结果逐行校验）：
+`cargo run --release -p lance-graph-benches --example graph_snapshot_latency -- 2000 20000 200000`，
+设置 `BENCH_COLUMN_CACHE_MB=512` 开启列缓存。
 
 多租户：一个缓存只能在同一安全上下文内共享。不同租户的数据集不同或权限不同时，按租户分别创建
 provider 和 cache。
@@ -129,11 +141,11 @@ let result = CypherQuery::new(text)?
 ## 8. 监控
 
 - 节点级：`cache.stats()` —— `entries`、`bytes`、`rows`、`full_builds`、`incremental_builds`、
-  `evictions`、`rejected_builds`。
+  `evictions`、`rejected_builds`；开启列缓存时还有 `column_entries`、`column_bytes`。
   建议告警：`rejected_builds` 增长（图超出 `max_edges`/预算，原生路径失效）；`evictions` 持续增长
   （预算不足、同一批数据反复重建）；`full_builds` 在无 compaction 时增长（增量推导没有生效）。
 - 查询级：`query.csr_adjacency_metrics()` —— `native_multihop_executions`、`native_multihop_fallbacks`、
-  `build_count`、`incremental_builds`、`cache_build_nanos`、`cache_evictions`。按查询打点，统计原生路径
+  `build_count`、`incremental_builds`、`cache_build_nanos`、`cache_evictions`、`column_cache_reads`。按查询打点，统计原生路径
   命中率和构建耗时分布。
 - 记录每个请求使用的 `snapshot.versions()`，便于排查“不同节点结果不同”（版本不同还是逻辑问题）。
 

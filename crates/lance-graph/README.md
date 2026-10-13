@@ -156,6 +156,12 @@ let query = CypherQuery::new(text)?.with_config(config).with_shared_csr_cache(ca
   entries. `cache.stats()` reports usage, full/incremental builds, evictions
   and rejected builds; `query.csr_adjacency_metrics()` reports per-query
   native executions, fallbacks, builds and build time.
+- `max_column_cache_bytes` (default 0, off) additionally keeps the property
+  columns that native traversals read in memory, per fragment and per version,
+  under its own budget; unchanged fragments are shared across versions. It
+  roughly halves hot latency because Lance has no data page cache. Prefill
+  with `cache.warm_columns(dataset, &["col", ...])`; `stats().column_entries`
+  / `column_bytes` and the per-query `column_cache_reads` show its use.
 - Multi-node services should read through `GraphSnapshotProvider` (one per
   node and security context): it pins every table to one version per query,
   serves read-your-writes via `GraphVersions` tokens (`at_least`) and exact

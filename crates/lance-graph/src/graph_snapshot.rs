@@ -19,7 +19,9 @@
 //! writer's protocol (see `docs/multi_node_deployment.md`).
 
 use crate::{CsrAdjacencyCache, GraphConfig, GraphError, Result};
-use datafusion::datasource::DefaultTableSource;
+use datafusion::{
+    datasource::DefaultTableSource, execution::context::SessionContext, prelude::SessionConfig,
+};
 use lance::{datafusion::LanceTableProvider, dataset::builder::DatasetBuilder, Dataset};
 use lance_graph_catalog::InMemoryCatalog;
 use lance_namespace::{models::DescribeTableRequest, LanceNamespace};
@@ -99,12 +101,29 @@ impl GraphVersions {
 
 /// Every table of a graph pinned to one committed version.
 pub struct GraphSnapshot {
+    contexts: Arc<Contexts>,
     datasets: BTreeMap<String, Arc<Dataset>>,
     versions: GraphVersions,
     catalog: Arc<InMemoryCatalog>,
     cache: Arc<CsrAdjacencyCache>,
     config: GraphConfig,
     bindings: Bindings,
+}
+
+/// Execution sessions reused by every query of a provider: creating one costs
+/// about as much as planning a native query.
+struct Contexts {
+    general: SessionContext,
+    native: SessionContext,
+}
+
+impl Contexts {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            general: SessionContext::new(),
+            native: crate::csr_multihop::native_session(SessionConfig::new()),
+        })
+    }
 }
 
 /// Which table backs each node label and relationship type.
@@ -156,7 +175,7 @@ impl GraphSnapshot {
         cache: Arc<CsrAdjacencyCache>,
     ) -> Result<Self> {
         let bindings = bindings(&config, table_names);
-        Self::assemble(config, bindings, tables, cache)
+        Self::assemble(config, bindings, tables, cache, Contexts::new())
     }
 
     fn assemble(
@@ -164,6 +183,7 @@ impl GraphSnapshot {
         bindings: Bindings,
         datasets: BTreeMap<String, Arc<Dataset>>,
         cache: Arc<CsrAdjacencyCache>,
+        contexts: Arc<Contexts>,
     ) -> Result<Self> {
         // One provider per physical table, so labels/types sharing a table also
         // share its dataset identity (required by native multi-hop paths).
@@ -197,6 +217,7 @@ impl GraphSnapshot {
                 .collect(),
         };
         Ok(Self {
+            contexts,
             datasets,
             versions,
             catalog: Arc::new(catalog),
@@ -224,6 +245,11 @@ impl GraphSnapshot {
 
     pub(crate) fn catalog(&self) -> Arc<InMemoryCatalog> {
         self.catalog.clone()
+    }
+
+    /// (general, native-path) execution sessions shared by the provider.
+    pub(crate) fn contexts(&self) -> (&SessionContext, &SessionContext) {
+        (&self.contexts.general, &self.contexts.native)
     }
 
     /// Build every relationship adjacency and node-ID map of these versions,
@@ -306,6 +332,7 @@ pub struct GraphSnapshotProvider {
     max_staleness: Duration,
     latest: tokio::sync::Mutex<Option<(Instant, Arc<GraphSnapshot>)>>,
     pinned: Mutex<Vec<Arc<GraphSnapshot>>>,
+    contexts: Arc<Contexts>,
 }
 
 const PINNED_SNAPSHOTS: usize = 8;
@@ -332,6 +359,7 @@ impl GraphSnapshotProvider {
             max_staleness: Duration::from_secs(1),
             latest: tokio::sync::Mutex::new(None),
             pinned: Mutex::new(Vec::new()),
+            contexts: Contexts::new(),
         }
     }
 
@@ -431,6 +459,7 @@ impl GraphSnapshotProvider {
             bindings,
             datasets,
             self.cache.clone(),
+            self.contexts.clone(),
         )?);
         let mut pinned = self.pinned.lock().expect("snapshot lock");
         pinned.insert(0, snapshot.clone());
@@ -488,6 +517,7 @@ impl GraphSnapshotProvider {
             bindings,
             datasets,
             self.cache.clone(),
+            self.contexts.clone(),
         )?);
         *latest = Some((Instant::now(), snapshot.clone()));
         Ok(snapshot)

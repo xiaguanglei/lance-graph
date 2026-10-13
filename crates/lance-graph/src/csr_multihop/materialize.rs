@@ -258,11 +258,22 @@ async fn edge_rows(
         .project_preserve_system_columns(requested.as_slice())
         .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
     let rows = rows.iter().copied().collect::<Vec<_>>();
-    let batch = spec
-        .edge_dataset
-        .take_rows(&rows, ProjectionRequest::Schema(Arc::new(projection)))
+    let names = requested
+        .iter()
+        .map(|name| name.as_str())
+        .collect::<Vec<_>>();
+    let batch = match spec
+        .cache
+        .cached_take(&spec.edge_dataset, &rows, &names, &spec.metrics)
         .await
-        .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
+    {
+        Some(batch) => batch,
+        None => spec
+            .edge_dataset
+            .take_rows(&rows, ProjectionRequest::Schema(Arc::new(projection)))
+            .await
+            .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?,
+    };
     if batch.num_rows() != rows.len() {
         return Ok(None);
     }
@@ -411,6 +422,12 @@ async fn take_nodes(
         .map_err(|error| datafusion::common::DataFusionError::External(Box::new(error)))?;
     let batch = if rows.is_empty() {
         RecordBatch::new_empty(Arc::new(Schema::from(&projection)))
+    } else if let Some(batch) = spec
+        .cache
+        .cached_take(&dataset, &rows, &names, &spec.metrics)
+        .await
+    {
+        batch
     } else {
         dataset
             .take_rows(&rows, ProjectionRequest::Schema(Arc::new(projection)))

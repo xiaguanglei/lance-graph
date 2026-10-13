@@ -214,10 +214,13 @@ impl CypherQuery {
         if query.config.is_none() {
             query.config = Some(snapshot.config().clone());
         }
+        let (ctx, native_ctx) = snapshot.contexts();
         query
-            .execute_with_catalog_and_context(
+            .execute_with_catalog_and_context_inner(
                 snapshot.catalog(),
-                datafusion::execution::context::SessionContext::new(),
+                ctx.clone(),
+                Some(native_ctx.clone()),
+                None,
             )
             .await
     }
@@ -682,7 +685,7 @@ impl CypherQuery {
         catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         ctx: datafusion::execution::context::SessionContext,
     ) -> Result<arrow::record_batch::RecordBatch> {
-        self.execute_with_catalog_and_context_inner(catalog, ctx, None)
+        self.execute_with_catalog_and_context_inner(catalog, ctx, None, None)
             .await
     }
 
@@ -693,7 +696,7 @@ impl CypherQuery {
         ctx: datafusion::execution::context::SessionContext,
         max_rows: usize,
     ) -> Result<arrow::record_batch::RecordBatch> {
-        self.execute_with_catalog_and_context_inner(catalog, ctx, Some(max_rows))
+        self.execute_with_catalog_and_context_inner(catalog, ctx, None, Some(max_rows))
             .await
     }
 
@@ -701,12 +704,19 @@ impl CypherQuery {
         &self,
         catalog: std::sync::Arc<dyn lance_graph_catalog::GraphSourceCatalog>,
         ctx: datafusion::execution::context::SessionContext,
+        native_ctx: Option<datafusion::execution::context::SessionContext>,
         max_rows: Option<usize>,
     ) -> Result<arrow::record_batch::RecordBatch> {
         use arrow::compute::concat_batches;
 
         // Create logical plans (phases 1-3)
         let (_logical_plan, df_logical_plan) = self.create_logical_plans(catalog)?;
+        // A plan driven by one native CSR operator produces a small result on
+        // one partition: plan and run it without repartitioning.
+        let ctx = match native_ctx {
+            Some(native_ctx) if crate::csr_multihop::is_native_plan(&df_logical_plan) => native_ctx,
+            _ => ctx,
+        };
 
         // Execute the DataFusion plan (phase 4)
         let df = ctx

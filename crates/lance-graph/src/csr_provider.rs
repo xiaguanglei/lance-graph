@@ -75,6 +75,12 @@ pub struct CsrScanOptions {
     pub max_cache_bytes: usize,
     pub max_bound_keys: usize,
     pub max_take_rows: usize,
+    /// Bytes of stored property columns cached for native paths, so hot
+    /// queries read node/edge properties from memory instead of storage.
+    /// 0 (the default) disables it. Columns are cached on first use per
+    /// version (shared across versions per unchanged fragment) and evicted
+    /// least-recently-used within this budget, separately from adjacency.
+    pub max_column_cache_bytes: usize,
 }
 
 impl Default for CsrScanOptions {
@@ -88,6 +94,7 @@ impl Default for CsrScanOptions {
             max_cache_bytes: 256 * 1024 * 1024,
             max_bound_keys: 256,
             max_take_rows: 20_000,
+            max_column_cache_bytes: 0,
         }
     }
 }
@@ -142,6 +149,8 @@ pub struct CsrScanMetrics {
     pub cache_evictions: AtomicU64,
     /// Wall time this query spent building cache entries (cold or delta).
     pub cache_build_nanos: AtomicU64,
+    /// Node/edge property reads served from the column cache (no storage I/O).
+    pub column_cache_reads: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

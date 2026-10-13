@@ -27,8 +27,8 @@ use crate::{
     csr_walk::AdjacencyView,
     CsrIndexBuilder,
 };
-use arrow_array::{Array, UInt64Array};
-use arrow_schema::DataType;
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow_schema::{DataType, Schema};
 use futures::TryStreamExt;
 use lance::{table::format::Fragment, Dataset};
 use std::{
@@ -56,11 +56,13 @@ const NODE_KEY_BYTES: usize = 96;
 // A delta larger than this share of its base (or than the floor) rebuilds.
 const DELTA_DIVISOR: usize = 4;
 const DELTA_FLOOR_ROWS: usize = 4096;
+// Column entries are bounded by their own byte budget; this only caps count.
+const MAX_COLUMN_SLOTS: usize = 256;
 
 /// Lifetime counters of one cache, for monitoring.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CsrCacheStats {
-    /// Ready entries (adjacency snapshots and node-ID maps) currently cached.
+    /// Ready adjacency snapshots and node-ID maps currently cached.
     pub entries: usize,
     /// Charged bytes / rows of cached entries; shared bases count once.
     pub bytes: usize,
@@ -70,6 +72,9 @@ pub struct CsrCacheStats {
     pub evictions: u64,
     /// Builds rejected as unsupported or larger than the configured limits.
     pub rejected_builds: u64,
+    /// Cached property columns and their bytes (`max_column_cache_bytes`).
+    pub column_entries: usize,
+    pub column_bytes: usize,
 }
 
 /// Share only within one caller's security context. Entries are pinned to the
@@ -101,6 +106,7 @@ struct CacheState {
     tick: u64,
     reserved_bytes: usize,
     reserved_rows: usize,
+    reserved_column_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -122,6 +128,7 @@ enum Outcome {
 enum Cached {
     Adjacency(Arc<AdjacencySnapshot>),
     NodeIds(Arc<NodeKeySnapshot>),
+    Column(Arc<ColumnSnapshot>),
 }
 
 impl Cached {
@@ -129,6 +136,7 @@ impl Cached {
         match self {
             Cached::Adjacency(value) => Arc::strong_count(value) > 1,
             Cached::NodeIds(value) => Arc::strong_count(value) > 1,
+            Cached::Column(value) => Arc::strong_count(value) > 1,
         }
     }
 }
@@ -142,8 +150,23 @@ struct Lineage {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum Kind {
-    Adjacency { source: String, target: String },
-    NodeIds { key: String },
+    Adjacency {
+        source: String,
+        target: String,
+    },
+    NodeIds {
+        key: String,
+    },
+    /// One stored property column (`max_column_cache_bytes`).
+    Column {
+        name: String,
+    },
+}
+
+impl CacheKey {
+    fn is_column(&self) -> bool {
+        matches!(self.lineage.kind, Kind::Column { .. })
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -559,6 +582,104 @@ async fn scan_fragment(
         .ok()
 }
 
+/// One stored property column of a pinned version, kept per fragment so
+/// versions share unchanged fragments. Values are the live rows at build time
+/// in row-offset order; later deletions never request the removed rows.
+#[derive(Debug)]
+pub(crate) struct ColumnSnapshot {
+    fragments: HashMap<u64, Arc<ColumnFragment>>,
+}
+
+#[derive(Debug)]
+struct ColumnFragment {
+    sig: FragmentSig,
+    offsets: Vec<u32>,
+    values: ArrayRef,
+    bytes: usize,
+}
+
+impl ColumnSnapshot {
+    /// Source array and position of a row address, if cached.
+    fn locate(&self, row: u64) -> Option<(&Arc<ColumnFragment>, usize)> {
+        let fragment = self.fragments.get(&fragment_of(row))?;
+        let position = fragment.offsets.binary_search(&(row as u32)).ok()?;
+        Some((fragment, position))
+    }
+}
+
+/// Scan `column` of the given fragments (all when None) into per-fragment
+/// arrays. None when the column cannot be cached within `budget` bytes.
+async fn scan_column(
+    dataset: &Dataset,
+    column: &str,
+    fragments: Option<Vec<Fragment>>,
+    budget: usize,
+) -> Option<HashMap<u64, Arc<ColumnFragment>>> {
+    let signatures = signatures(dataset);
+    let mut scanner = dataset.scan();
+    if let Some(fragments) = fragments {
+        if fragments.is_empty() {
+            return Some(HashMap::new());
+        }
+        scanner.with_fragments(fragments);
+    }
+    scanner.project(&[column]).ok()?;
+    scanner.with_row_address().batch_size(8192);
+    let mut batches = scanner.try_into_stream().await.ok()?;
+    let mut chunks: HashMap<u64, (Vec<u32>, Vec<ArrayRef>)> = HashMap::new();
+    let mut scanned = 0usize;
+    while let Some(batch) = batches.try_next().await.ok()? {
+        let values = batch.column_by_name(column)?;
+        let addresses = batch
+            .column_by_name("_rowaddr")?
+            .as_any()
+            .downcast_ref::<UInt64Array>()?;
+        // Scans are fragment-ordered: slice each run of one fragment.
+        let mut start = 0;
+        while start < batch.num_rows() {
+            let fragment = fragment_of(addresses.value(start));
+            let mut end = start + 1;
+            while end < batch.num_rows() && fragment_of(addresses.value(end)) == fragment {
+                end += 1;
+            }
+            let entry = chunks.entry(fragment).or_default();
+            entry
+                .0
+                .extend((start..end).map(|row| addresses.value(row) as u32));
+            entry.1.push(values.slice(start, end - start));
+            start = end;
+        }
+        scanned = scanned.checked_add(batch.get_array_memory_size())?;
+        if scanned > budget.saturating_mul(2) {
+            return None;
+        }
+    }
+    let mut result = HashMap::new();
+    let mut bytes = 0usize;
+    for (fragment, (offsets, chunks)) in chunks {
+        let refs = chunks
+            .iter()
+            .map(|chunk| chunk.as_ref())
+            .collect::<Vec<_>>();
+        let values = arrow::compute::concat(&refs).ok()?;
+        let size = values.get_array_memory_size() + offsets.len() * 4;
+        bytes = bytes.checked_add(size)?;
+        if bytes > budget {
+            return None;
+        }
+        result.insert(
+            fragment,
+            Arc::new(ColumnFragment {
+                sig: signatures.get(&fragment)?.clone(),
+                offsets,
+                values,
+                bytes: size,
+            }),
+        );
+    }
+    Some(result)
+}
+
 impl Default for CsrAdjacencyCache {
     fn default() -> Self {
         Self::new(CsrScanOptions::default())
@@ -569,13 +690,18 @@ struct Reservation<'a> {
     cache: &'a CsrAdjacencyCache,
     bytes: usize,
     rows: usize,
+    column: bool,
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         let mut state = self.cache.state.lock().expect("CSR cache lock");
-        state.reserved_bytes -= self.bytes;
-        state.reserved_rows -= self.rows;
+        if self.column {
+            state.reserved_column_bytes -= self.bytes;
+        } else {
+            state.reserved_bytes -= self.bytes;
+            state.reserved_rows -= self.rows;
+        }
     }
 }
 
@@ -598,15 +724,25 @@ impl CsrAdjacencyCache {
     /// Current usage and lifetime counters.
     pub fn stats(&self) -> CsrCacheStats {
         let state = self.state.lock().expect("CSR cache lock");
-        let (bytes, rows) = usage(&state.slots);
+        let used = usage(&state.slots);
         CsrCacheStats {
             entries: state
                 .slots
-                .values()
-                .filter(|slot| matches!(slot.cell.get(), Some(Outcome::Ready(_))))
+                .iter()
+                .filter(|(key, slot)| {
+                    !key.is_column() && matches!(slot.cell.get(), Some(Outcome::Ready(_)))
+                })
                 .count(),
-            bytes,
-            rows,
+            column_entries: state
+                .slots
+                .iter()
+                .filter(|(key, slot)| {
+                    key.is_column() && matches!(slot.cell.get(), Some(Outcome::Ready(_)))
+                })
+                .count(),
+            bytes: used.bytes,
+            rows: used.rows,
+            column_bytes: used.column_bytes,
             full_builds: self.full_builds.load(Ordering::Relaxed),
             incremental_builds: self.incremental_builds.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
@@ -628,6 +764,169 @@ impl CsrAdjacencyCache {
         self.node_keys(dataset, id_field, &CsrScanMetrics::default())
             .await
             .is_some()
+    }
+
+    /// Cache these stored columns of this dataset version ahead of queries
+    /// (needs `max_column_cache_bytes`). Returns how many are now cached.
+    pub async fn warm_columns(&self, dataset: Arc<Dataset>, columns: &[&str]) -> usize {
+        let mut cached = 0;
+        for column in columns {
+            if self
+                .column(dataset.clone(), column, &CsrScanMetrics::default())
+                .await
+                .is_some()
+            {
+                cached += 1;
+            }
+        }
+        cached
+    }
+
+    /// Rows `rows` (row addresses, any order, duplicates allowed) of stored
+    /// `columns`, served from cached columns without storage I/O. None when
+    /// the column cache is disabled, a column does not fit, or a row is not
+    /// cached; callers then read through Lance.
+    pub(crate) async fn cached_take(
+        &self,
+        dataset: &Arc<Dataset>,
+        rows: &[u64],
+        columns: &[&str],
+        metrics: &CsrScanMetrics,
+    ) -> Option<RecordBatch> {
+        if self.options.max_column_cache_bytes == 0
+            || dataset.manifest().uses_stable_row_ids()
+            || columns.is_empty()
+        {
+            return None;
+        }
+        let schema = Arc::new(Schema::from(&dataset.schema().project(columns).ok()?));
+        let mut arrays = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let column = self.column(dataset.clone(), field.name(), metrics).await?;
+            let mut sources: Vec<&dyn Array> = Vec::new();
+            let mut source_of: HashMap<usize, usize> = HashMap::new();
+            let mut indices = Vec::with_capacity(rows.len());
+            for row in rows {
+                let (fragment, position) = column.locate(*row)?;
+                let key = Arc::as_ptr(fragment) as usize;
+                let source = *source_of.entry(key).or_insert_with(|| {
+                    sources.push(fragment.values.as_ref());
+                    sources.len() - 1
+                });
+                indices.push((source, position));
+            }
+            arrays.push(if rows.is_empty() {
+                arrow_array::new_empty_array(field.data_type())
+            } else {
+                arrow::compute::interleave(&sources, &indices).ok()?
+            });
+        }
+        let batch = RecordBatch::try_new_with_options(
+            schema,
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(rows.len())),
+        )
+        .ok()?;
+        metrics.column_cache_reads.fetch_add(1, Ordering::Relaxed);
+        Some(batch)
+    }
+
+    async fn column(
+        &self,
+        dataset: Arc<Dataset>,
+        name: &str,
+        metrics: &CsrScanMetrics,
+    ) -> Option<Arc<ColumnSnapshot>> {
+        let key = CacheKey::new(&dataset, Kind::Column { name: name.into() });
+        let built = self
+            .lookup(key.clone(), metrics, |candidate| async move {
+                let started = Instant::now();
+                let previous = match candidate {
+                    Some(Cached::Column(snapshot)) => Some(snapshot),
+                    _ => None,
+                };
+                let outcome = self
+                    .build_column(&dataset, name, previous, &key, metrics)
+                    .await;
+                metrics
+                    .cache_build_nanos
+                    .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                outcome
+            })
+            .await;
+        match built {
+            Some((Cached::Column(snapshot), _)) => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    /// Reuse every fragment whose data is unchanged since `previous` (only
+    /// deletions may differ: deleted rows are never requested) and scan the
+    /// rest; without a previous version, scan the whole column.
+    async fn build_column(
+        &self,
+        dataset: &Dataset,
+        name: &str,
+        previous: Option<Arc<ColumnSnapshot>>,
+        key: &CacheKey,
+        metrics: &CsrScanMetrics,
+    ) -> Outcome {
+        if dataset.schema().field(name).is_none() {
+            return self.rejected();
+        }
+        let budget = self.options.max_column_cache_bytes;
+        let current = signatures(dataset);
+        let mut fragments = HashMap::new();
+        let mut missing = Vec::new();
+        for fragment in dataset.manifest().fragments.iter() {
+            let reused = previous.as_ref().and_then(|previous| {
+                previous
+                    .fragments
+                    .get(&fragment.id)
+                    .filter(|cached| cached.sig.same_data(&current[&fragment.id]))
+            });
+            match reused {
+                Some(cached) => {
+                    fragments.insert(fragment.id, cached.clone());
+                }
+                None => missing.push(fragment.clone()),
+            }
+        }
+        let incremental = previous.is_some() && missing.len() < current.len();
+        let estimate = missing
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .sum::<usize>()
+            .saturating_mul(16);
+        let Some(reservation) = self.reserve(key, estimate.min(budget), 0, metrics) else {
+            return Outcome::Busy;
+        };
+        let Some(scanned) = scan_column(dataset, name, Some(missing), budget).await else {
+            return self.rejected();
+        };
+        drop(reservation);
+        let new_bytes = scanned
+            .values()
+            .map(|fragment| fragment.bytes)
+            .sum::<usize>();
+        fragments.extend(scanned);
+        let total = fragments
+            .values()
+            .map(|fragment| fragment.bytes)
+            .sum::<usize>();
+        if total > budget {
+            return self.rejected();
+        }
+        if self.reserve(key, new_bytes, 0, metrics).is_none() {
+            return Outcome::Busy;
+        }
+        if incremental {
+            self.incremental_builds.fetch_add(1, Ordering::Relaxed);
+            metrics.incremental_builds.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.full_builds.fetch_add(1, Ordering::Relaxed);
+        }
+        Outcome::Ready(Cached::Column(Arc::new(ColumnSnapshot { fragments })))
     }
 
     /// Cheap plan-time check: false when this version's adjacency is known to
@@ -750,9 +1049,19 @@ impl CsrAdjacencyCache {
                     None => slot.cell.clone(),
                 }
             } else {
-                if state.slots.len() >= self.options.max_cache_slots
-                    && !self.evict_one(&mut state, &key, metrics)
-                {
+                let column = key.is_column();
+                let (count, limit) = if column {
+                    (
+                        state.slots.keys().filter(|key| key.is_column()).count(),
+                        MAX_COLUMN_SLOTS,
+                    )
+                } else {
+                    (
+                        state.slots.keys().filter(|key| !key.is_column()).count(),
+                        self.options.max_cache_slots,
+                    )
+                };
+                if count >= limit && !self.evict_one(&mut state, &key, metrics) {
                     return None;
                 }
                 let cell = Arc::new(OnceCell::new());
@@ -808,7 +1117,7 @@ impl CsrAdjacencyCache {
         let victim = state
             .slots
             .iter()
-            .filter(|(key, _)| *key != protect)
+            .filter(|(key, _)| *key != protect && key.is_column() == protect.is_column())
             .filter(|(_, slot)| match slot.cell.get() {
                 Some(Outcome::Ready(cached)) => !cached.in_use(),
                 Some(_) => true,
@@ -835,23 +1144,38 @@ impl CsrAdjacencyCache {
         metrics: &CsrScanMetrics,
     ) -> Option<Reservation<'_>> {
         let mut state = self.state.lock().expect("CSR cache lock");
+        // Property columns have their own budget and only evict each other.
+        let column = protect.is_column();
         loop {
-            let (used_bytes, used_rows) = usage(&state.slots);
-            let fits = used_bytes
-                .saturating_add(state.reserved_bytes)
-                .saturating_add(bytes)
-                <= self.options.max_cache_bytes
-                && used_rows
-                    .saturating_add(state.reserved_rows)
-                    .saturating_add(rows)
-                    <= self.options.max_cache_rows;
+            let used = usage(&state.slots);
+            let fits = if column {
+                used.column_bytes
+                    .saturating_add(state.reserved_column_bytes)
+                    .saturating_add(bytes)
+                    <= self.options.max_column_cache_bytes
+            } else {
+                used.bytes
+                    .saturating_add(state.reserved_bytes)
+                    .saturating_add(bytes)
+                    <= self.options.max_cache_bytes
+                    && used
+                        .rows
+                        .saturating_add(state.reserved_rows)
+                        .saturating_add(rows)
+                        <= self.options.max_cache_rows
+            };
             if fits {
-                state.reserved_bytes += bytes;
-                state.reserved_rows += rows;
+                if column {
+                    state.reserved_column_bytes += bytes;
+                } else {
+                    state.reserved_bytes += bytes;
+                    state.reserved_rows += rows;
+                }
                 return Some(Reservation {
                     cache: self,
                     bytes,
                     rows,
+                    column,
                 });
             }
             if !self.evict_one(&mut state, protect, metrics) {
@@ -1216,33 +1540,47 @@ impl CsrAdjacencyCache {
     }
 }
 
-/// Charged usage of ready entries; a base shared by several versions counts once.
-fn usage(slots: &HashMap<CacheKey, Slot>) -> (usize, usize) {
-    let mut bases = HashSet::new();
-    let mut bytes = 0usize;
-    let mut rows = 0usize;
+#[derive(Debug, Default)]
+struct Usage {
+    bytes: usize,
+    rows: usize,
+    column_bytes: usize,
+}
+
+/// Charged usage of ready entries; a base or column fragment shared by several
+/// versions counts once.
+fn usage(slots: &HashMap<CacheKey, Slot>) -> Usage {
+    let mut shared = HashSet::new();
+    let mut used = Usage::default();
     for slot in slots.values() {
         match slot.cell.get() {
             Some(Outcome::Ready(Cached::Adjacency(snapshot))) => {
-                if bases.insert(Arc::as_ptr(&snapshot.base) as usize) {
-                    bytes += snapshot.base.bytes;
-                    rows += snapshot.base.rows;
+                if shared.insert(Arc::as_ptr(&snapshot.base) as usize) {
+                    used.bytes += snapshot.base.bytes;
+                    used.rows += snapshot.base.rows;
                 }
-                bytes += snapshot.delta_bytes;
-                rows += snapshot.delta_rows;
+                used.bytes += snapshot.delta_bytes;
+                used.rows += snapshot.delta_rows;
             }
             Some(Outcome::Ready(Cached::NodeIds(snapshot))) => {
-                if bases.insert(Arc::as_ptr(&snapshot.base) as usize) {
-                    bytes += snapshot.base.bytes;
-                    rows += snapshot.base.row_ids.len();
+                if shared.insert(Arc::as_ptr(&snapshot.base) as usize) {
+                    used.bytes += snapshot.base.bytes;
+                    used.rows += snapshot.base.row_ids.len();
                 }
-                bytes += snapshot.delta_bytes;
-                rows += snapshot.delta_rows;
+                used.bytes += snapshot.delta_bytes;
+                used.rows += snapshot.delta_rows;
+            }
+            Some(Outcome::Ready(Cached::Column(snapshot))) => {
+                for fragment in snapshot.fragments.values() {
+                    if shared.insert(Arc::as_ptr(fragment) as usize) {
+                        used.column_bytes += fragment.bytes;
+                    }
+                }
             }
             _ => {}
         }
     }
-    (bytes, rows)
+    used
 }
 
 fn empty_csr() -> CsrIndex {
@@ -1867,5 +2205,138 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(derived.edges(), fresh(&back).await.0);
+    }
+
+    async fn live_rows(dataset: &Dataset) -> Vec<u64> {
+        let mut scanner = dataset.scan();
+        scanner.project::<&str>(&[]).unwrap();
+        scanner.with_row_address();
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("_rowaddr")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .clone();
+                (0..ids.len()).map(move |row| ids.value(row))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn column_cache_reads_equal_storage_reads_across_versions() {
+        use lance::dataset::ProjectionRequest;
+        let temp = tempfile::tempdir().unwrap();
+        let uri = temp.path().join("edges.lance");
+        let uri = uri.to_str().unwrap();
+        let mut rng = Rng(21);
+        let mut dataset = write(uri, &rng.rows(300, 0), WriteMode::Create, false).await;
+        let cache = CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 16 << 20,
+            ..options()
+        });
+        assert!(CsrAdjacencyCache::new(options())
+            .cached_take(
+                &Arc::new(dataset.clone()),
+                &[0],
+                &["dst"],
+                &CsrScanMetrics::default()
+            )
+            .await
+            .is_none());
+        let columns = ["src", "dst", "w"];
+        let mut versions = Vec::new();
+        for step in 0..10 {
+            match step % 5 {
+                0 => {
+                    dataset = write(
+                        uri,
+                        &rng.rows(25, 1000 + step * 100),
+                        WriteMode::Append,
+                        false,
+                    )
+                    .await
+                }
+                1 => {
+                    dataset
+                        .delete(&format!("w % {} = 1", 3 + step))
+                        .await
+                        .unwrap();
+                }
+                2 => {
+                    compact_files(&mut dataset, Default::default(), None)
+                        .await
+                        .unwrap();
+                }
+                3 => {
+                    dataset.delete("w % 13 = 2").await.unwrap();
+                    dataset = write(
+                        uri,
+                        &rng.rows(5, 5000 + step * 100),
+                        WriteMode::Append,
+                        false,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+            versions.push(dataset.version_id());
+            let mut targets = vec![Arc::new(dataset.clone())];
+            if step % 5 == 4 {
+                let earlier = versions[rng.next(versions.len() as u64) as usize];
+                targets.push(Arc::new(dataset.checkout_version(earlier).await.unwrap()));
+            }
+            for target in targets {
+                let live = live_rows(&target).await;
+                // Random live rows, unordered, with duplicates.
+                let rows = (0..40)
+                    .map(|_| live[rng.next(live.len() as u64) as usize])
+                    .collect::<Vec<_>>();
+                let projection = Arc::new(target.schema().project(&columns).unwrap());
+                let expected = target
+                    .take_rows(&rows, ProjectionRequest::Schema(projection))
+                    .await
+                    .unwrap();
+                let metrics = CsrScanMetrics::default();
+                match cache.cached_take(&target, &rows, &columns, &metrics).await {
+                    Some(batch) => {
+                        assert_eq!(batch, expected, "step {step} v{}", target.version_id());
+                        assert_eq!(metrics.column_cache_reads.load(Ordering::Relaxed), 1);
+                    }
+                    // Only a time-travel read of rows deleted when a shared
+                    // fragment was cached may miss; it then reads storage.
+                    None => assert!(target.version_id() < dataset.version_id(), "step {step}"),
+                }
+            }
+        }
+        let stats = cache.stats();
+        assert!(stats.column_bytes > 0 && stats.column_bytes <= 16 << 20);
+        assert!(stats.incremental_builds > 0, "{stats:?}");
+        // A budget too small for one column is rejected, not partially cached.
+        let tiny = CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 64,
+            ..options()
+        });
+        let current = Arc::new(dataset.clone());
+        assert!(tiny
+            .cached_take(
+                &current,
+                &[live_rows(&current).await[0]],
+                &["dst"],
+                &CsrScanMetrics::default()
+            )
+            .await
+            .is_none());
+        assert_eq!(tiny.stats().column_bytes, 0);
     }
 }

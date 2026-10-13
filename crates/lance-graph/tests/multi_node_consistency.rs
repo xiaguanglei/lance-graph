@@ -422,6 +422,11 @@ async fn nodes_agree_on_rows_and_pages_for_the_same_versions() {
             max_cache_slots: 1,
             ..Default::default()
         }))),
+        // Node 4 serves node/edge properties from its column cache.
+        graph.provider(Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 32 << 20,
+            ..Default::default()
+        }))),
     ];
     let mut snapshots = Vec::new();
     for node in &nodes {
@@ -479,7 +484,7 @@ async fn nodes_agree_on_rows_and_pages_for_the_same_versions() {
             let count = |row: &Vec<Option<String>>| row[1].as_ref().unwrap().parse::<u64>().unwrap();
             assert!(full_rows.windows(2).all(|w| count(&w[0]) >= count(&w[1])), "{text}");
         }
-        for (snapshot, native) in snapshots.iter().zip([true, false, true]) {
+        for (snapshot, native) in snapshots.iter().zip([true, false, true, true]) {
             let other = ordered(native).execute_with_snapshot(snapshot).await.unwrap();
             assert_eq!(rows(&other), rows(&full), "{text}");
         }
@@ -585,15 +590,12 @@ async fn expired_versions_never_return_wrong_rows_and_refresh_recovers() {
     // entirely from caches) return exactly the old rows, never other rows.
     let reader = graph.provider(Arc::new(CsrAdjacencyCache::default()));
     for text in QUERIES {
-        match reader.at(old.versions()).await {
-            Ok(snapshot) => match query(text, true).execute_with_snapshot(&snapshot).await {
-                Ok(batch) => {
-                    let index = QUERIES.iter().position(|q| q == text).unwrap();
-                    assert_eq!(bag(&batch), old_results[index], "{text}");
-                }
-                Err(_) => {}
-            },
-            Err(_) => {}
+        let Ok(snapshot) = reader.at(old.versions()).await else {
+            continue;
+        };
+        if let Ok(batch) = query(text, true).execute_with_snapshot(&snapshot).await {
+            let index = QUERIES.iter().position(|q| q == text).unwrap();
+            assert_eq!(bag(&batch), old_results[index], "{text}");
         }
     }
     let latest = node.refresh().await.unwrap();
@@ -676,6 +678,8 @@ async fn concurrent_queries_and_writes_on_one_node_stay_exact() {
         graph
             .provider(Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
                 max_cache_slots: 3,
+                // Room for about one column: constant column evictions too.
+                max_column_cache_bytes: 4 << 10,
                 ..Default::default()
             })))
             .with_max_staleness(Duration::ZERO),

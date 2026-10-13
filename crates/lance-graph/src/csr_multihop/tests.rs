@@ -457,6 +457,25 @@ async fn compare(text: &str, fixture: &Fixture, expected_native: bool) -> Record
             > 0,
         expected_native
     );
+    // The same query with property columns served from the column cache, cold
+    // (columns built) and hot (read from memory), must return the same rows.
+    let columns = Arc::new(CsrAdjacencyCache::new(crate::CsrScanOptions {
+        max_column_cache_bytes: 64 << 20,
+        ..fixture.cache.options().clone()
+    }));
+    for round in 0..2 {
+        let cached = query(text, fixture, true).with_shared_csr_cache(columns.clone());
+        let again = cached
+            .execute_with_context_limited(context(fixture), 1000)
+            .await
+            .unwrap();
+        assert_eq!(baseline.schema(), again.schema(), "column cache contract");
+        assert_eq!(row_keys(&baseline), row_keys(&again), "column cache rows");
+        let metrics = cached.csr_adjacency_metrics();
+        if round == 1 && metrics.native_multihop_executions.load(Ordering::Relaxed) > 0 {
+            assert!(metrics.column_cache_reads.load(Ordering::Relaxed) >= 1);
+        }
+    }
     result
 }
 

@@ -69,6 +69,27 @@ pub(crate) fn supports_query(ast: &QueryAst) -> bool {
             if (1..=3).contains(&path.segments.len()) && path.segments.iter().all(|s| s.relationship.length.is_none())))
 }
 
+pub(crate) const NATIVE_TABLE: &str = "__native_csr_multihop";
+
+/// True when the DataFusion plan reads the native CSR multi-hop operator.
+pub(crate) fn is_native_plan(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::TreeNode;
+    plan.exists(|node| {
+        Ok(matches!(node, LogicalPlan::TableScan(scan) if scan.table_name.table() == NATIVE_TABLE))
+    })
+    .unwrap_or(false)
+}
+
+/// Session for plans driven by the native operator: its output is one small
+/// partition, so repartitioning for parallelism only adds task hand-offs.
+pub(crate) fn native_session(
+    config: datafusion::prelude::SessionConfig,
+) -> datafusion::execution::context::SessionContext {
+    datafusion::execution::context::SessionContext::new_with_config(
+        config.with_target_partitions(1),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Slice {
     alias: String,

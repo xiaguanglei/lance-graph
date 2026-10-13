@@ -35,7 +35,7 @@ impl DataFusionPlanner {
         if self.native_multihop.is_some() {
             if let Some(source) = crate::csr_multihop::try_source(self, ctx, op)? {
                 return datafusion::logical_expr::LogicalPlanBuilder::scan(
-                    "__native_csr_multihop",
+                    crate::csr_multihop::NATIVE_TABLE,
                     source,
                     None,
                 )
