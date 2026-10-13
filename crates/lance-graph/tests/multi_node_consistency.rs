@@ -745,3 +745,180 @@ async fn missing_tables_are_reported_not_silently_empty() {
     assert!(node.at(&unknown).await.is_err());
     assert!(node.at(&token).await.is_ok());
 }
+
+/// Schema changes that keep data files (renames, drop + re-add, a swapped
+/// pair of columns that reverses every edge), rewrites (update, overwrite),
+/// restore and compaction: long-lived nodes that derive caches incrementally
+/// (with and without the column cache, one constantly evicting) return the
+/// same rows as a cold node and as the JOIN plan at every version.
+#[tokio::test]
+async fn schema_changes_and_rewrites_stay_exact_on_every_node() {
+    use lance::dataset::{ColumnAlteration, NewColumnTransform, UpdateBuilder};
+    let graph = graph().await;
+    let nodes = [
+        graph.provider(Arc::new(CsrAdjacencyCache::default())),
+        graph.provider(Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 32 << 20,
+            ..Default::default()
+        }))),
+        graph.provider(Arc::new(CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 2 << 10,
+            max_cache_slots: 2,
+            ..Default::default()
+        }))),
+    ];
+    let open = |table: &str| {
+        let uri = graph.uri(table);
+        async move { Dataset::open(&uri).await.unwrap() }
+    };
+    let rename = |from: &str, to: &str| ColumnAlteration::new(from.into()).rename(to.into());
+    let add = |name: &str, expr: &str| {
+        NewColumnTransform::SqlExpressions(vec![(name.to_owned(), expr.to_owned())])
+    };
+    let memory_v1 = open("Memory").await.version_id();
+    let mut previous: Option<Vec<Vec<Vec<Option<String>>>>> = None;
+    for step in 0..9 {
+        match step {
+            0 => {}
+            // New `content` under the old name; the old data stays as another field.
+            1 => {
+                let mut memory = open("Memory").await;
+                memory
+                    .alter_columns(&[rename("content", "content_old")])
+                    .await
+                    .unwrap();
+                memory
+                    .add_columns(add("content", "concat('new ', memory_id)"), None, None)
+                    .await
+                    .unwrap();
+            }
+            // Swap two returned columns' names: metadata only, same files.
+            2 => {
+                let mut memory = open("Memory").await;
+                for (from, to) in [
+                    ("content", "tmp"),
+                    ("content_old", "content"),
+                    ("tmp", "content_old"),
+                ] {
+                    memory.alter_columns(&[rename(from, to)]).await.unwrap();
+                }
+            }
+            // Drop and re-add a filtered column with different values.
+            3 => {
+                let mut memory = open("Memory").await;
+                memory.drop_columns(&["visible"]).await.unwrap();
+                memory
+                    .add_columns(add("visible", "memory_id > 'm4'"), None, None)
+                    .await
+                    .unwrap();
+            }
+            // Invert `allowed` without rewriting any existing file.
+            4 => {
+                let mut entity = open("Entity").await;
+                entity
+                    .add_columns(add("blocked", "NOT allowed"), None, None)
+                    .await
+                    .unwrap();
+                entity.drop_columns(&["allowed"]).await.unwrap();
+                entity
+                    .alter_columns(&[rename("blocked", "allowed")])
+                    .await
+                    .unwrap();
+            }
+            // Swap endpoint names: every edge reverses, data files unchanged.
+            5 => {
+                let mut edges = open(EDGES).await;
+                for (from, to) in [
+                    ("source_id", "tmp"),
+                    ("target_id", "source_id"),
+                    ("tmp", "target_id"),
+                ] {
+                    edges.alter_columns(&[rename(from, to)]).await.unwrap();
+                }
+            }
+            // Rewrite REL edge ids, then compact and delete.
+            6 => {
+                let edges = open(EDGES).await;
+                UpdateBuilder::new(Arc::new(edges))
+                    .update_where("relationship_type = 'REL'")
+                    .unwrap()
+                    .set("edge_id", "concat(edge_id, '_u')")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .execute()
+                    .await
+                    .unwrap();
+                let mut edges = open(EDGES).await;
+                compact_files(&mut edges, Default::default(), None)
+                    .await
+                    .unwrap();
+                edges.delete("edge_id = 'rel_0_1_u'").await.unwrap();
+            }
+            // Overwrite entities with the same ids and other flags.
+            7 => {
+                let rows = (0..12)
+                    .map(|i| (format!("e{i}"), i % 2 == 0))
+                    .collect::<Vec<_>>();
+                write(
+                    &graph.uri("Entity"),
+                    entities(
+                        &rows
+                            .iter()
+                            .map(|(id, allowed)| (id.as_str(), *allowed))
+                            .collect::<Vec<_>>(),
+                    ),
+                    WriteMode::Overwrite,
+                )
+                .await;
+            }
+            // Swap the endpoints back (the original field layout, whose
+            // entries the long-lived nodes may still hold) and restore the
+            // original memory table as a new version.
+            8 => {
+                let mut edges = open(EDGES).await;
+                for (from, to) in [
+                    ("source_id", "tmp"),
+                    ("target_id", "source_id"),
+                    ("tmp", "target_id"),
+                ] {
+                    edges.alter_columns(&[rename(from, to)]).await.unwrap();
+                }
+                let mut memory = open("Memory")
+                    .await
+                    .checkout_version(memory_v1)
+                    .await
+                    .unwrap();
+                memory.restore().await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let token = graph.versions().await;
+        let cold = graph
+            .provider(Arc::new(CsrAdjacencyCache::default()))
+            .at(&token)
+            .await
+            .unwrap();
+        let expected = results(&cold).await;
+        for (index, node) in nodes.iter().enumerate() {
+            let snapshot = node.at_least(&token).await.unwrap();
+            assert_eq!(snapshot.versions(), &token, "step {step} node {index}");
+            assert_eq!(
+                results(&snapshot).await,
+                expected,
+                "step {step} node {index}"
+            );
+        }
+        if step > 0 {
+            assert_ne!(
+                previous.as_ref(),
+                Some(&expected),
+                "step {step} must change results"
+            );
+        }
+        previous = Some(expected);
+    }
+    // The column cache was used, incrementally, across these versions.
+    let stats = nodes[1].cache().stats();
+    assert!(stats.column_entries > 0, "{stats:?}");
+}

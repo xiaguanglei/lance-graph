@@ -157,9 +157,12 @@ enum Kind {
     NodeIds {
         key: String,
     },
-    /// One stored property column (`max_column_cache_bytes`).
+    /// One stored property column (`max_column_cache_bytes`), by Lance field
+    /// id and type, never by name: a rename or a dropped and re-added name
+    /// keeps the data files, so name-keyed reuse would serve another field.
     Column {
-        name: String,
+        field: i32,
+        data_type: arrow_schema::DataType,
     },
 }
 
@@ -193,10 +196,14 @@ impl CacheKey {
     }
 }
 
-/// What makes the rows of one fragment: data files, overlays and deletions.
+/// Path, base, field ids and column indices of one data file.
+type FileSig = (String, Option<u32>, Arc<[i32]>, Arc<[i32]>);
+
+/// What makes the rows of one fragment: data files (with the fields and
+/// columns each stores), overlays and deletions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FragmentSig {
-    files: Vec<(String, Option<u32>)>,
+    files: Vec<FileSig>,
     overlays: Vec<(String, Option<u32>, u64)>,
     deletion: Option<(u64, u64, Option<u32>, bool)>,
     physical_rows: Option<usize>,
@@ -208,7 +215,14 @@ impl FragmentSig {
             files: fragment
                 .files
                 .iter()
-                .map(|file| (file.path.clone(), file.base_id))
+                .map(|file| {
+                    (
+                        file.path.clone(),
+                        file.base_id,
+                        file.fields.clone(),
+                        file.column_indices.clone(),
+                    )
+                })
                 .collect(),
             overlays: fragment
                 .overlays
@@ -837,7 +851,14 @@ impl CsrAdjacencyCache {
         name: &str,
         metrics: &CsrScanMetrics,
     ) -> Option<Arc<ColumnSnapshot>> {
-        let key = CacheKey::new(&dataset, Kind::Column { name: name.into() });
+        let field = dataset.schema().field(name)?;
+        let key = CacheKey::new(
+            &dataset,
+            Kind::Column {
+                field: field.id,
+                data_type: field.data_type(),
+            },
+        );
         let built = self
             .lookup(key.clone(), metrics, |candidate| async move {
                 let started = Instant::now();
@@ -2338,5 +2359,140 @@ mod tests {
             .await
             .is_none());
         assert_eq!(tiny.stats().column_bytes, 0);
+    }
+
+    /// Cached reads of every column equal storage reads after each kind of
+    /// write: schema evolution that keeps data files (rename, drop + rename,
+    /// swap), rewrites (cast, update), overwrite, restore and a dataset
+    /// recreated at the same URI. Earlier versions stay exact too.
+    #[tokio::test]
+    async fn column_cache_tracks_schema_evolution_and_rewrites() {
+        use lance::dataset::{
+            ColumnAlteration, NewColumnTransform, ProjectionRequest, UpdateBuilder,
+        };
+        async fn check(cache: &CsrAdjacencyCache, dataset: &Dataset, latest: bool, step: &str) {
+            let dataset = Arc::new(dataset.clone());
+            let rows = live_rows(&dataset).await;
+            let names = dataset
+                .schema()
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect::<Vec<_>>();
+            for name in &names {
+                let projection = Arc::new(dataset.schema().project(&[name.as_str()]).unwrap());
+                let expected = dataset
+                    .take_rows(&rows, ProjectionRequest::Schema(projection))
+                    .await
+                    .unwrap();
+                let cached = cache
+                    .cached_take(
+                        &dataset,
+                        &rows,
+                        &[name.as_str()],
+                        &CsrScanMetrics::default(),
+                    )
+                    .await;
+                match cached {
+                    Some(batch) => assert_eq!(batch, expected, "{step}: {name}"),
+                    None => assert!(!latest, "{step}: {name} must be served"),
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("edges.lance");
+        let uri = path.to_str().unwrap();
+        let mut rng = Rng(5);
+        let mut dataset = write(uri, &rng.rows(120, 0), WriteMode::Create, false).await;
+        let cache = CsrAdjacencyCache::new(CsrScanOptions {
+            max_column_cache_bytes: 16 << 20,
+            ..options()
+        });
+        let mut history = vec![dataset.version_id()];
+        let steps = [
+            "create",
+            "add_column",
+            "drop_then_rename",
+            "swap_names",
+            "cast",
+            "update",
+            "delete",
+            "overwrite",
+            "restore",
+            "recreate",
+        ];
+        for (index, step) in steps.into_iter().enumerate() {
+            match step {
+                "create" => {}
+                "add_column" => dataset
+                    .add_columns(
+                        NewColumnTransform::SqlExpressions(vec![("x".into(), "w * 2".into())]),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                // Metadata only: `dst` now names the former `src` field.
+                "drop_then_rename" => {
+                    dataset.drop_columns(&["dst"]).await.unwrap();
+                    dataset
+                        .alter_columns(&[ColumnAlteration::new("src".into()).rename("dst".into())])
+                        .await
+                        .unwrap();
+                }
+                "swap_names" => {
+                    for (from, to) in [("w", "tmp"), ("x", "w"), ("tmp", "x")] {
+                        dataset
+                            .alter_columns(&[ColumnAlteration::new(from.into()).rename(to.into())])
+                            .await
+                            .unwrap();
+                    }
+                }
+                "cast" => dataset
+                    .alter_columns(&[
+                        ColumnAlteration::new("w".into()).cast_to(arrow_schema::DataType::Int64)
+                    ])
+                    .await
+                    .unwrap(),
+                "update" => {
+                    let updated = UpdateBuilder::new(Arc::new(dataset.clone()))
+                        .update_where("x % 3 = 0")
+                        .unwrap()
+                        .set("w", "w + 1000")
+                        .unwrap()
+                        .build()
+                        .unwrap()
+                        .execute()
+                        .await
+                        .unwrap();
+                    dataset = updated.new_dataset.as_ref().clone();
+                }
+                "delete" => {
+                    dataset.delete("x % 5 = 1").await.unwrap();
+                }
+                "overwrite" => {
+                    dataset = write(uri, &rng.rows(60, 9000), WriteMode::Overwrite, false).await;
+                }
+                "restore" => {
+                    let mut earlier = dataset.checkout_version(history[3]).await.unwrap();
+                    earlier.restore().await.unwrap();
+                    dataset = earlier;
+                }
+                "recreate" => {
+                    std::fs::remove_dir_all(&path).unwrap();
+                    dataset = write(uri, &rng.rows(80, 20000), WriteMode::Create, false).await;
+                    history.clear();
+                }
+                _ => unreachable!(),
+            }
+            history.push(dataset.version_id());
+            check(&cache, &dataset, true, step).await;
+            // Earlier versions (in shuffled order) read their own data.
+            for version in history.iter().rev().skip(1).take(index) {
+                let earlier = dataset.checkout_version(*version).await.unwrap();
+                check(&cache, &earlier, false, &format!("{step} @v{version}")).await;
+            }
+            check(&cache, &dataset, true, step).await;
+        }
     }
 }
