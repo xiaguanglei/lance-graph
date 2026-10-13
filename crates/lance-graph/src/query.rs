@@ -132,6 +132,8 @@ pub struct CypherQuery {
     csr_native_multihop_enabled: bool,
     csr_adjacency_cache: Arc<crate::CsrAdjacencyCache>,
     csr_adjacency_metrics: Arc<crate::CsrScanMetrics>,
+    /// Order rows by the result itself (see `with_deterministic_order`).
+    deterministic_order: bool,
 }
 impl CypherQuery {
     /// Create a new Cypher query from a query string
@@ -148,6 +150,7 @@ impl CypherQuery {
             csr_native_multihop_enabled: true,
             csr_adjacency_cache: Arc::new(crate::CsrAdjacencyCache::default()),
             csr_adjacency_metrics: Arc::new(crate::CsrScanMetrics::default()),
+            deterministic_order: false,
         })
     }
 
@@ -187,10 +190,42 @@ impl CypherQuery {
         crate::csr_multihop::supports_query(&self.ast)
     }
 
+    /// Make the row order a function of the result rows, identical on every
+    /// node and execution path: an existing ORDER BY gets every remaining
+    /// column as a tie-breaker, otherwise all orderable output columns are
+    /// sorted, below any SKIP/LIMIT so pages never overlap or skip rows.
+    /// Without it only the bag of rows is defined (a native CSR path and the
+    /// JOIN plan, or two nodes, may return a different order or LIMIT subset).
+    /// Nested columns (structs, lists, vectors) are not used as sort keys.
+    pub fn with_deterministic_order(mut self, enabled: bool) -> Self {
+        self.deterministic_order = enabled;
+        self
+    }
+
+    /// Execute against a version-pinned [`crate::GraphSnapshot`] (every table
+    /// at a fixed version) with the snapshot's shared CSR cache; the query's
+    /// own cache setting is replaced, its metrics are kept. The snapshot's
+    /// graph config is used unless the query has one.
+    pub async fn execute_with_snapshot(
+        &self,
+        snapshot: &crate::GraphSnapshot,
+    ) -> Result<RecordBatch> {
+        let mut query = self.clone().with_shared_csr_cache(snapshot.cache().clone());
+        if query.config.is_none() {
+            query.config = Some(snapshot.config().clone());
+        }
+        query
+            .execute_with_catalog_and_context(
+                snapshot.catalog(),
+                datafusion::execution::context::SessionContext::new(),
+            )
+            .await
+    }
+
     /// Reuse adjacency across queries in the same caller's storage context.
     ///
-    /// Entries are pinned to dataset, manifest, session and object-store identity;
-    /// a new snapshot never consumes stale adjacency. This is an explicit bounded
+    /// Entries are pinned to the committed version's content identity; a new
+    /// version never consumes stale adjacency. This is an explicit bounded
     /// cache, not a global cache of query results or ACL decisions. Without this
     /// method the cache lives with this query (and its clones) only.
     ///
@@ -1026,6 +1061,14 @@ impl CypherQuery {
             });
         }
         let df_logical_plan = df_planner.plan(&logical_plan)?;
+        let df_logical_plan = if self.deterministic_order {
+            deterministic_order(df_logical_plan).map_err(|e| GraphError::PlanError {
+                message: format!("Failed to order results deterministically: {e}"),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+        } else {
+            df_logical_plan
+        };
 
         Ok((logical_plan, df_logical_plan))
     }
@@ -1472,9 +1515,85 @@ impl CypherQueryBuilder {
             csr_native_multihop_enabled: true,
             csr_adjacency_cache: Arc::new(crate::CsrAdjacencyCache::default()),
             csr_adjacency_metrics: Arc::new(crate::CsrScanMetrics::default()),
+            deterministic_order: false,
         };
 
         Ok(query)
+    }
+}
+
+/// Sort by the result rows: extend the first ORDER BY below LIMIT/OFFSET and
+/// projections with every orderable column of its input as tie-breakers, or
+/// add one on the output columns. Equal rows on all keys are interchangeable
+/// (projections are functions of their input), so the order is determined.
+fn deterministic_order(
+    plan: datafusion::logical_expr::LogicalPlan,
+) -> datafusion::common::Result<datafusion::logical_expr::LogicalPlan> {
+    use datafusion::logical_expr::{Expr, Limit, LogicalPlan, Projection, Sort, SortExpr};
+    fn has_sort(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Sort(_) => true,
+            LogicalPlan::Projection(projection) => has_sort(&projection.input),
+            LogicalPlan::SubqueryAlias(alias) => has_sort(&alias.input),
+            _ => false,
+        }
+    }
+    fn keys(plan: &LogicalPlan, existing: &[SortExpr]) -> Vec<SortExpr> {
+        plan.schema()
+            .iter()
+            .filter(|(_, field)| {
+                let datatype = field.data_type();
+                datatype.is_primitive()
+                    || matches!(
+                        datatype,
+                        arrow_schema::DataType::Boolean
+                            | arrow_schema::DataType::Utf8
+                            | arrow_schema::DataType::LargeUtf8
+                            | arrow_schema::DataType::Utf8View
+                            | arrow_schema::DataType::Binary
+                            | arrow_schema::DataType::LargeBinary
+                            | arrow_schema::DataType::BinaryView
+                            | arrow_schema::DataType::Dictionary(_, _)
+                    )
+            })
+            .map(|(qualifier, field)| {
+                Expr::Column(datafusion::common::Column::new(
+                    qualifier.cloned(),
+                    field.name(),
+                ))
+            })
+            .filter(|column| !existing.iter().any(|sort| &sort.expr == column))
+            .map(|column| column.sort(true, true))
+            .collect()
+    }
+    match plan {
+        LogicalPlan::Limit(limit) => Ok(LogicalPlan::Limit(Limit {
+            input: Arc::new(deterministic_order(Arc::unwrap_or_clone(limit.input))?),
+            ..limit
+        })),
+        LogicalPlan::Sort(sort) => {
+            let mut expr = sort.expr.clone();
+            expr.extend(keys(&sort.input, &sort.expr));
+            Ok(LogicalPlan::Sort(Sort { expr, ..sort }))
+        }
+        LogicalPlan::Projection(projection) if has_sort(&projection.input) => {
+            let input = deterministic_order(Arc::unwrap_or_clone(projection.input))?;
+            Ok(LogicalPlan::Projection(Projection::try_new(
+                projection.expr,
+                Arc::new(input),
+            )?))
+        }
+        other => {
+            let expr = keys(&other, &[]);
+            if expr.is_empty() {
+                return Ok(other);
+            }
+            Ok(LogicalPlan::Sort(Sort {
+                expr,
+                input: Arc::new(other),
+                fetch: None,
+            }))
+        }
     }
 }
 
@@ -1710,6 +1829,79 @@ mod tests {
         let ages = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
         let collected: Vec<i64> = (0..out.num_rows()).map(|i| ages.value(i)).collect();
         assert_eq!(collected, vec![28, 29, 34, 42]);
+    }
+
+    #[tokio::test]
+    async fn deterministic_order_breaks_ties_and_tiles_pages_in_memory() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, true),
+                Field::new("age", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("d"),
+                    Some("b"),
+                    None,
+                    Some("a"),
+                    Some("c"),
+                    Some("b"),
+                ])),
+                Arc::new(Int64Array::from(vec![30, 20, 30, 30, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+        let run = |text: &str| {
+            let q = CypherQuery::new(text)
+                .unwrap()
+                .with_config(cfg.clone())
+                .with_deterministic_order(true);
+            let data = HashMap::from([("Person".to_string(), batch.clone())]);
+            async move {
+                let out = q.execute(data, None).await.unwrap();
+                (0..out.num_rows())
+                    .map(|row| {
+                        out.columns()
+                            .iter()
+                            .map(|array| {
+                                arrow::util::display::array_value_to_string(array, row).unwrap()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        // Ties on age are broken by name (NULLs first); age stays primary.
+        let full = run("MATCH (p:Person) RETURN p.name, p.age ORDER BY p.age DESC").await;
+        let expected = [
+            ["", "30"],
+            ["a", "30"],
+            ["b", "30"],
+            ["d", "30"],
+            ["b", "20"],
+            ["c", "20"],
+        ];
+        assert_eq!(full, expected.map(|row| row.map(String::from).to_vec()));
+        // Without ORDER BY every column is a key; pages tile the full result.
+        let all = run("MATCH (p:Person) RETURN p.age, p.name").await;
+        let mut pages = Vec::new();
+        for skip in [0, 2, 4] {
+            pages.extend(
+                run(&format!(
+                    "MATCH (p:Person) RETURN p.age, p.name SKIP {skip} LIMIT 2"
+                ))
+                .await,
+            );
+        }
+        assert_eq!(pages, all);
+        assert_eq!(all[0], vec!["20".to_string(), "b".to_string()]);
     }
 
     #[tokio::test]

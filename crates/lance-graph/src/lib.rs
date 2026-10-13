@@ -45,6 +45,7 @@ mod csr_provider;
 pub mod csr_walk;
 pub mod datafusion_planner;
 pub mod error;
+mod graph_snapshot;
 pub mod lance_native_planner;
 pub mod lance_vector_search;
 pub mod logical_plan;
@@ -70,6 +71,7 @@ pub use csr_walk::{
     csr_walk_filtered, csr_walk_steps_filtered, CsrWalk, CsrWalkOptions, CsrWalkResult,
 };
 pub use error::{GraphError, Result};
+pub use graph_snapshot::{GraphSnapshot, GraphSnapshotProvider, GraphVersions, WarmReport};
 pub use lance_graph_catalog::{
     DirNamespace, GraphSourceCatalog, InMemoryCatalog, SimpleTableSource,
 };
