@@ -6,6 +6,9 @@ Provides two query interfaces:
   (requires a ``GraphConfig`` with node/relationship mappings).
 - **SQL**: ``SqlQuery`` and ``SqlEngine`` for standard SQL queries executed
   directly against datasets via DataFusion (no ``GraphConfig`` needed).
+- **Services**: ``GraphSnapshotProvider`` serves version-pinned
+  ``GraphSnapshot`` reads over Lance tables with a shared CSR cache, and
+  ``GraphVersions`` tokens for read-your-writes across nodes.
 """
 
 from __future__ import annotations
@@ -88,6 +91,9 @@ VectorSearch = _bindings.graph.VectorSearch
 DistanceMetric = _bindings.graph.DistanceMetric
 
 DirNamespace = _bindings.graph.DirNamespace
+GraphVersions = _bindings.graph.GraphVersions
+GraphSnapshot = _bindings.graph.GraphSnapshot
+GraphSnapshotProvider = _bindings.graph.GraphSnapshotProvider
 
 UnityCatalog = _bindings.graph.UnityCatalog
 CatalogInfo = _bindings.graph.CatalogInfo
@@ -106,6 +112,9 @@ __all__ = [
     "VectorSearch",
     "DistanceMetric",
     "DirNamespace",
+    "GraphVersions",
+    "GraphSnapshot",
+    "GraphSnapshotProvider",
     "UnityCatalog",
     "CatalogInfo",
     "SchemaInfo",

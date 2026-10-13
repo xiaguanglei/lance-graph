@@ -324,7 +324,7 @@ pub(crate) fn graph_error_to_pyerr(err: RustGraphError) -> PyErr {
 #[pyclass(name = "GraphConfig", module = "lance.graph", from_py_object)]
 #[derive(Clone)]
 pub struct GraphConfig {
-    inner: RustGraphConfig,
+    pub(crate) inner: RustGraphConfig,
 }
 
 #[pymethods]
@@ -436,7 +436,7 @@ impl GraphConfigBuilder {
 #[pyclass(name = "CypherQuery", module = "lance.graph", from_py_object)]
 #[derive(Clone)]
 pub struct CypherQuery {
-    inner: RustCypherQuery,
+    pub(crate) inner: RustCypherQuery,
 }
 
 #[pymethods]
@@ -647,6 +647,42 @@ impl CypherQuery {
         record_batch_to_python_table(py, &result_batch)
     }
 
+    /// Make row order and SKIP/LIMIT pages identical on every node.
+    ///
+    /// Sorts the final result by all returned columns after any ORDER BY
+    /// keys. Use it for paginated or limited reads in multi-node services.
+    #[pyo3(signature = (enabled=true))]
+    fn with_deterministic_order(&self, enabled: bool) -> Self {
+        Self {
+            inner: self.inner.clone().with_deterministic_order(enabled),
+        }
+    }
+
+    /// Execute on a version-pinned ``GraphSnapshot``.
+    ///
+    /// Parameters
+    /// ----------
+    /// snapshot : GraphSnapshot
+    ///     From ``GraphSnapshotProvider.latest()``, ``at_least()`` or ``at()``.
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.Table
+    fn execute_with_snapshot(
+        &self,
+        py: Python,
+        snapshot: &Bound<'_, crate::snapshot::GraphSnapshot>,
+    ) -> PyResult<Py<PyAny>> {
+        let snapshot = snapshot.borrow().inner.clone();
+        let inner_query = self.inner.clone();
+        let result_batch = RT
+            .block_on(Some(py), async move {
+                inner_query.execute_with_snapshot(&snapshot).await
+            })?
+            .map_err(graph_error_to_pyerr)?;
+        record_batch_to_python_table(py, &result_batch)
+    }
+
     /// Explain query using the DataFusion planner with in-memory datasets
     ///
     /// Parameters
@@ -776,7 +812,7 @@ impl CypherQuery {
 }
 
 // Helper functions to convert between Python and JSON values
-fn python_to_json(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+pub(crate) fn python_to_json(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
     if value.is_none() {
         Ok(JsonValue::Null)
     } else if let Ok(b) = value.extract::<bool>() {
@@ -1102,7 +1138,7 @@ fn python_any_to_record_batch(value: &Bound<'_, PyAny>) -> PyResult<RecordBatch>
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to concatenate batches: {}", e)))
 }
 
-fn record_batch_to_python_table(
+pub(crate) fn record_batch_to_python_table(
     py: Python,
     batch: &arrow_array::RecordBatch,
 ) -> PyResult<Py<PyAny>> {
@@ -1593,6 +1629,9 @@ pub fn register_graph_module(py: Python, parent_module: &Bound<'_, PyModule>) ->
     graph_module.add_class::<SqlEngine>()?;
     graph_module.add_class::<VectorSearch>()?;
     graph_module.add_class::<PyDirNamespace>()?;
+    graph_module.add_class::<crate::snapshot::GraphVersions>()?;
+    graph_module.add_class::<crate::snapshot::GraphSnapshot>()?;
+    graph_module.add_class::<crate::snapshot::GraphSnapshotProvider>()?;
 
     crate::catalog::register_catalog_module(py, &graph_module)?;
 

@@ -152,10 +152,27 @@ let result = CypherQuery::new(text)?
 ## 9. 绑定与接入方式
 
 - Rust 服务：直接使用本文的 API。
-- Python 服务：当前 Python 绑定的 `CypherEngine` 会在构造时把数据集整体读入内存表，**不使用 CSR、
-  不感知版本、也不会刷新**；`CypherQuery.execute_with_namespace` 每次读各表最新版本且每次新建缓存。
-  多节点部署前需要先为 `GraphSnapshotProvider` / `GraphSnapshot` / `GraphVersions` /
-  `with_deterministic_order` 增加 Python 绑定（引擎侧工作，尚未完成）。
+- Python 服务：使用同名绑定，语义与 Rust 一致（每个进程/安全上下文一个 provider，所有请求共用）：
+
+  ```python
+  from lance_graph import DirNamespace, GraphSnapshotProvider, GraphVersions
+
+  provider = GraphSnapshotProvider(
+      DirNamespace(root), config,
+      tables={"MENTIONS": "graph_edges", "REL": "graph_edges"},
+      max_staleness_ms=500,
+      max_cache_bytes=2 << 30, max_column_cache_bytes=512 << 20,
+  )
+  provider.latest().warm()                       # 就绪探针前
+  snapshot = provider.at_least(token) if token else provider.latest()
+  table = snapshot.execute(text, parameters={"id": "e0"}, deterministic_order=True)
+  # 写接口：返回 GraphVersions({"graph_edges": ds.version, ...}).to_token()
+  # 分页：provider.at(token)；监控：provider.cache_stats()
+  ```
+
+  调用期间释放 GIL，多线程服务可以并发查询。注意：`CypherEngine` 会在构造时把数据集整体读入内存表，
+  **不使用 CSR、不感知版本、也不会刷新**；`CypherQuery.execute_with_namespace` 每次读各表最新版本且
+  每次新建缓存，二者都不适合多节点服务。
 
 ## 10. 上线检查清单
 

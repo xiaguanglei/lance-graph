@@ -6,6 +6,7 @@ mod catalog;
 mod executor;
 mod graph;
 mod namespace;
+mod snapshot;
 
 pub(crate) static RT: LazyLock<executor::BackgroundExecutor> =
     LazyLock::new(executor::BackgroundExecutor::new);
