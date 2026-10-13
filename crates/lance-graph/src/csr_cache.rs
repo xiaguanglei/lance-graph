@@ -27,12 +27,16 @@ use crate::{
     csr_walk::AdjacencyView,
     CsrIndexBuilder,
 };
-use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, StringArray, UInt64Array,
+};
 use arrow_schema::Schema;
+// hashbrown with foldhash (randomly seeded): several times faster than the
+// std SipHash for the millions of key lookups of a cold build.
+use datafusion::common::{HashMap, HashSet};
 use futures::TryStreamExt;
 use lance::{table::format::Fragment, Dataset};
 use std::{
-    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -532,7 +536,7 @@ async fn delta_plan(
     let current = signatures(dataset);
     let mut masked = base_fragments
         .keys()
-        .filter(|id| !current.contains_key(id))
+        .filter(|id| !current.contains_key(*id))
         .copied()
         .collect::<HashSet<_>>();
     let mut changed = Vec::new();
@@ -1664,6 +1668,110 @@ fn empty_csr() -> CsrIndex {
     CsrIndexBuilder::new().with_num_vertices(0).build()
 }
 
+/// A node-key column of one batch, downcast once. Text keys are looked up
+/// by `&str` so only a newly seen key allocates.
+enum KeyColumn<'a> {
+    Text(&'a StringArray),
+    Number(&'a UInt64Array),
+    Signed(&'a Int64Array),
+}
+
+impl<'a> KeyColumn<'a> {
+    fn new(array: &'a dyn Array) -> Option<Self> {
+        let any = array.as_any();
+        if let Some(array) = any.downcast_ref::<StringArray>() {
+            Some(Self::Text(array))
+        } else if let Some(array) = any.downcast_ref::<UInt64Array>() {
+            Some(Self::Number(array))
+        } else {
+            any.downcast_ref::<Int64Array>().map(Self::Signed)
+        }
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Text(array) => array.is_null(row),
+            Self::Number(array) => array.is_null(row),
+            Self::Signed(array) => array.is_null(row),
+        }
+    }
+}
+
+/// Dense ids of node keys in first-seen order, equal to inserting
+/// `array_endpoint` values into a `HashMap<Endpoint, _>`; with `reverse`
+/// also `endpoints[id]` (a second copy of each key, as adjacency needs).
+struct KeyInterner {
+    text: HashMap<Box<str>, u64>,
+    other: HashMap<Endpoint, u64>,
+    endpoints: Option<Vec<Endpoint>>,
+    len: usize,
+}
+
+impl KeyInterner {
+    fn new(reverse: bool) -> Self {
+        Self {
+            text: HashMap::new(),
+            other: HashMap::new(),
+            endpoints: reverse.then(Vec::new),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The id of the non-null key at `row`, or `Err(new key)` when unseen;
+    /// `admit` then decides (budget checks) and [`Self::insert`] adds it.
+    fn get(&self, column: &KeyColumn<'_>, row: usize) -> Result<u64, Endpoint> {
+        match column {
+            KeyColumn::Text(array) => {
+                let value = array.value(row);
+                self.text
+                    .get(value)
+                    .copied()
+                    .ok_or_else(|| Endpoint::Text(value.to_owned()))
+            }
+            KeyColumn::Number(array) => {
+                let key = Endpoint::Number(array.value(row));
+                self.other.get(&key).copied().ok_or(key)
+            }
+            KeyColumn::Signed(array) => {
+                let key = Endpoint::Signed(array.value(row));
+                self.other.get(&key).copied().ok_or(key)
+            }
+        }
+    }
+
+    fn insert(&mut self, key: Endpoint) -> u64 {
+        let id = self.len as u64;
+        self.len += 1;
+        if let Some(endpoints) = &mut self.endpoints {
+            endpoints.push(key.clone());
+        }
+        match key {
+            Endpoint::Text(text) => {
+                self.text.insert(text.into_boxed_str(), id);
+            }
+            other => {
+                self.other.insert(other, id);
+            }
+        }
+        id
+    }
+
+    /// The key -> id map (moving the interned text without copying it) and
+    /// the reverse vector when kept.
+    fn into_parts(self) -> (HashMap<Endpoint, u64>, Vec<Endpoint>) {
+        let mut ids = self.other;
+        ids.reserve(self.text.len());
+        for (text, id) in self.text {
+            ids.insert(Endpoint::Text(text.into_string()), id);
+        }
+        (ids, self.endpoints.unwrap_or_default())
+    }
+}
+
 async fn build_base(
     dataset: &Dataset,
     source: &str,
@@ -1676,8 +1784,7 @@ async fn build_base(
     let deletions = deletions(dataset).await?;
     let budget = options.max_bytes;
     let edge_bytes = expected_rows.checked_mul(PEAK_EDGE_BYTES)?;
-    let mut vertices: HashMap<Endpoint, u64> = HashMap::new();
-    let mut endpoints: Vec<Endpoint> = Vec::new();
+    let mut vertices = KeyInterner::new(true);
     let mut text_bytes = 0usize;
     let mut max_batch_bytes = 0usize;
     let estimate = |vertices: usize, text_bytes: usize, max_batch_bytes: usize| {
@@ -1702,8 +1809,10 @@ async fn build_base(
         if estimate(vertices.len(), text_bytes, max_batch_bytes)? > budget {
             return None;
         }
-        let sources = batch.column_by_name(source)?;
-        let targets = batch.column_by_name(target)?;
+        let columns = [
+            KeyColumn::new(batch.column_by_name(source)?.as_ref())?,
+            KeyColumn::new(batch.column_by_name(target)?.as_ref())?,
+        ];
         let ids = batch
             .column_by_name("_rowid")?
             .as_any()
@@ -1713,11 +1822,13 @@ async fn build_base(
                 return None;
             }
             let mut dense = [0u64; 2];
-            for (slot, array) in [sources, targets].into_iter().enumerate() {
-                let value = array_endpoint(array.as_ref(), row)?;
-                dense[slot] = match vertices.get(&value) {
-                    Some(id) => *id,
-                    None => {
+            for (slot, column) in columns.iter().enumerate() {
+                if column.is_null(row) {
+                    return None;
+                }
+                dense[slot] = match vertices.get(column, row) {
+                    Ok(id) => id,
+                    Err(value) => {
                         if vertices.len() >= options.max_vertices {
                             return None;
                         }
@@ -1725,10 +1836,7 @@ async fn build_base(
                         if estimate(vertices.len() + 1, text_bytes, max_batch_bytes)? > budget {
                             return None;
                         }
-                        let id = vertices.len() as u64;
-                        endpoints.push(value.clone());
-                        vertices.insert(value, id);
-                        id
+                        vertices.insert(value)
                     }
                 };
             }
@@ -1745,8 +1853,9 @@ async fn build_base(
     if rows != expected_rows {
         return None;
     }
-    endpoints.shrink_to_fit();
     let count = vertices.len() as u64;
+    let (vertices, mut endpoints) = vertices.into_parts();
+    endpoints.shrink_to_fit();
     // Retained: two CSRs plus both vertex directions and their text.
     let bytes = rows
         .checked_mul(RETAINED_EDGE_BYTES)?
@@ -1786,7 +1895,7 @@ async fn build_node_base(
     if estimate(0, 0, 0)? > budget {
         return None;
     }
-    let mut keys: HashMap<Endpoint, u32> = HashMap::new();
+    let mut keys = KeyInterner::new(false);
     let mut pairs: Vec<(u32, u64)> = Vec::with_capacity(expected_rows);
     let mut text_bytes = 0usize;
     let mut max_batch_bytes = 0usize;
@@ -1796,7 +1905,7 @@ async fn build_node_base(
     let mut batches = scanner.try_into_stream().await.ok()?;
     while let Some(batch) = batches.try_next().await.ok()? {
         max_batch_bytes = max_batch_bytes.max(batch.get_array_memory_size());
-        let values = batch.column_by_name(key)?;
+        let values = KeyColumn::new(batch.column_by_name(key)?.as_ref())?;
         let ids = batch
             .column_by_name("_rowid")?
             .as_any()
@@ -1806,22 +1915,17 @@ async fn build_node_base(
                 return None;
             }
             // A NULL ID never equals a bound key; the row cannot be selected.
-            let Some(value) = array_endpoint(values.as_ref(), row) else {
-                if values.is_null(row) {
-                    continue;
-                }
-                return None;
-            };
-            let dense = match keys.get(&value) {
-                Some(dense) => *dense,
-                None => {
+            if values.is_null(row) {
+                continue;
+            }
+            let dense = match keys.get(&values, row) {
+                Ok(dense) => u32::try_from(dense).ok()?,
+                Err(value) => {
                     text_bytes = text_bytes.checked_add(text_cost(&value) / 2)?;
                     if estimate(keys.len() + 1, text_bytes, max_batch_bytes)? > budget {
                         return None;
                     }
-                    let dense = u32::try_from(keys.len()).ok()?;
-                    keys.insert(value, dense);
-                    dense
+                    u32::try_from(keys.insert(value)).ok()?
                 }
             };
             pairs.push((dense, ids.value(row)));
@@ -1843,7 +1947,11 @@ async fn build_node_base(
         row_ids[*slot as usize] = row_id;
         *slot += 1;
     }
-    keys.shrink_to_fit();
+    let (keys, _) = keys.into_parts();
+    let keys = keys
+        .into_iter()
+        .map(|(key, dense)| Some((key, u32::try_from(dense).ok()?)))
+        .collect::<Option<HashMap<_, _>>>()?;
     Some(NodeIdBase {
         keys,
         offsets,

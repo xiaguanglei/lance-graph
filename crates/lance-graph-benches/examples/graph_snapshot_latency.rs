@@ -6,7 +6,9 @@
 //! `cargo run --release -p lance-graph-benches --example graph_snapshot_latency -- 2000 20000 200000`
 //! Set BENCH_COLUMN_CACHE_MB to enable the property column cache, ITERS for
 //! the sample count. Every query is first checked against the JOIN plan
-//! (schema and row bag) and must run natively.
+//! (schema and row bag) and must run natively. BENCH_CLIENTS (default
+//! "1,2,4,8") then runs the query mix from that many concurrent clients for
+//! two seconds each and reports throughput and latency.
 
 use arrow_array::{BooleanArray, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -149,6 +151,11 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
+    let client_counts = std::env::var("BENCH_CLIENTS")
+        .unwrap_or_else(|_| "1,2,4,8".into())
+        .split(',')
+        .filter_map(|value| value.trim().parse::<usize>().ok())
+        .collect::<Vec<_>>();
     let column_mb: usize = std::env::var("BENCH_COLUMN_CACHE_MB")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -241,6 +248,41 @@ async fn main() {
                     started.elapsed().as_secs_f64() * 1000.
                 },
                 column_reads / iters as u64,
+            );
+        }
+        for clients in &client_counts {
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            let tasks = (0..*clients)
+                .map(|client| {
+                    let snapshot = snapshot.clone();
+                    tokio::spawn(async move {
+                        let mut latencies = Vec::new();
+                        let mut next = client;
+                        while Instant::now() < deadline {
+                            let (_, _, text) = QUERIES[next % QUERIES.len()];
+                            next += 1;
+                            let started = Instant::now();
+                            CypherQuery::new(text)
+                                .unwrap()
+                                .execute_with_snapshot(&snapshot)
+                                .await
+                                .unwrap();
+                            latencies.push(started.elapsed().as_secs_f64() * 1000.);
+                        }
+                        latencies
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut all = Vec::new();
+            for task in tasks {
+                all.extend(task.await.unwrap());
+            }
+            all.sort_by(f64::total_cmp);
+            println!(
+                "qps n={n} clients={clients} qps={:.0} p50_ms={:.3} p99_ms={:.3}",
+                all.len() as f64 / 2.0,
+                all[all.len() / 2],
+                all[all.len() * 99 / 100]
             );
         }
         println!("cache n={n} {:?}", provider.cache().stats());
