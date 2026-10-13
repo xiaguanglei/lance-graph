@@ -170,15 +170,16 @@ impl CypherQuery {
         self
     }
 
-    /// Disable only native multi-hop when comparing against the unchanged
-    /// single-hop CSR/JOIN executor. Other adjacency and version rules remain.
+    /// Disable only native fixed-path traversal (one to three hops, seeded by
+    /// bound source IDs) when comparing against the unchanged per-hop CSR/JOIN
+    /// executor. Other adjacency and version rules remain.
     pub fn with_native_multihop(mut self, enabled: bool) -> Self {
         self.csr_native_multihop_enabled = enabled;
         self
     }
 
     /// Cheap AST-shape hint for choosing replayable table providers: one fixed
-    /// two- or three-hop MATCH without WITH. This does not validate storage,
+    /// one- to three-hop MATCH without WITH. This does not validate storage,
     /// bindings, predicates, indexes, budgets or actual native execution, and
     /// is intentionally independent of execution flags and parameter values.
     /// Use `csr_adjacency_metrics()` after execution to prove consumption.

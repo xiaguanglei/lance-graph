@@ -777,8 +777,13 @@ fn public_shape_hint_is_not_native_execution_evidence() {
         .unwrap()
         .with_native_multihop(false)
         .native_multihop_candidate());
+    assert!(
+        crate::CypherQuery::new("MATCH (a:Entity)-[r:REL]->(b:Entity) RETURN b.entity_id")
+            .unwrap()
+            .native_multihop_candidate()
+    );
     for text in [
-        "MATCH (a:Entity)-[r:REL]->(b:Entity) RETURN b.entity_id",
+        "MATCH (a:Entity)-[:REL]->(b)-[:REL]->(c)-[:REL]->(d)-[:REL]->(e) RETURN e.entity_id",
         "MATCH (a:Entity)-[r:REL*1..3]->(b:Entity) RETURN b.entity_id",
         "MATCH (a:Entity)-[r:REL]->(b:Entity)-[s:REL]->(c:Entity) WITH c RETURN c.entity_id",
     ] {
@@ -897,4 +902,170 @@ async fn shared_table_aliases_hoist_id_list_for_node_btree() {
             .load(Ordering::Relaxed),
         0
     );
+}
+
+#[tokio::test]
+async fn single_hop_outgoing_incoming_and_edge_properties_are_exact() {
+    for cached in [false, true] {
+        let fixture = fixture(false, false, 100, cached).await;
+        let out = compare(
+            "MATCH (a:Entity {entity_id:'e1'})-[r:REL]->(b:Entity) \
+             RETURN a.name, b.entity_id, b.name, r.edge_id, r.confidence",
+            &fixture,
+            true,
+        )
+        .await;
+        assert_eq!(out.num_rows(), 2); // r12 and the e1 -> e0 cycle edge.
+                                       // Incoming keeps both physical parallel edges and the edge ACL mask.
+        let incoming = compare(
+            "MATCH (e:Entity)<-[r:MENTIONS]-(m:Memory) \
+             WHERE e.entity_id = 'e0' AND m.visible = true AND r.confidence > 0.5 \
+             RETURN m.memory_id, m.content, r.edge_id, r.confidence",
+            &fixture,
+            true,
+        )
+        .await;
+        assert_eq!(incoming.num_rows(), 2);
+        let filtered = compare(
+            "MATCH (a:Entity)-[r:REL]->(b:Entity) \
+             WHERE a.entity_id IN ['e0', 'e1', 'e2'] AND r.confidence >= 0.5 AND b.name <> 'two' \
+             RETURN a.entity_id, b.entity_id, r.edge_id",
+            &fixture,
+            true,
+        )
+        .await;
+        assert_eq!(filtered.num_rows(), 2); // r01, r23; r12 targets 'two', cycle is 0.4.
+    }
+}
+
+#[tokio::test]
+async fn single_hop_duplicates_null_endpoints_and_budget_fallback() {
+    let duplicated = fixture(true, false, 100, false).await;
+    let result = compare(
+        "MATCH (m:Memory {memory_id:'m0'})-[r:MENTIONS]->(e:Entity {allowed:true}) \
+         RETURN m.content, e.name, r.edge_id",
+        &duplicated,
+        true,
+    )
+    .await;
+    // 3 m0 rows x (2 parallel e0 edges x 2 allowed e0 rows + 1 edge x 2 allowed e1 rows).
+    assert_eq!(result.num_rows(), 3 * (2 * 2 + 2));
+    for (null_endpoint, budget, admitted) in
+        [(true, 100, false), (false, 3, true), (false, 2, false)]
+    {
+        let fixture = fixture(false, null_endpoint, budget, true).await;
+        let result = compare(
+            "MATCH (m:Memory {memory_id:'m0'})-[r:MENTIONS]->(e:Entity) RETURN e.entity_id, r.edge_id",
+            &fixture,
+            admitted,
+        )
+        .await;
+        // The edge to an absent 'missing' node never joins.
+        assert_eq!(result.num_rows(), 3);
+    }
+}
+
+#[tokio::test]
+async fn single_hop_aggregates_ordering_parameters_and_empty_seed() {
+    let fixture = fixture(false, false, 100, false).await;
+    let prefix =
+        "MATCH (m:Memory)-[r:MENTIONS]->(e:Entity) WHERE m.memory_id IN ['m0', 'mh', 'mn']";
+    let ordered = compare(
+        &format!("{prefix} RETURN e.entity_id, r.edge_id ORDER BY r.edge_id DESC LIMIT 3"),
+        &fixture,
+        true,
+    )
+    .await;
+    assert_eq!(ordered.num_rows(), 3);
+    let distinct = compare(
+        &format!("{prefix} RETURN DISTINCT e.entity_id ORDER BY e.entity_id"),
+        &fixture,
+        true,
+    )
+    .await;
+    assert_eq!(distinct.num_rows(), 4);
+    let grouped = compare(
+        &format!("{prefix} RETURN m.memory_id, COUNT(*) AS edges"),
+        &fixture,
+        true,
+    )
+    .await;
+    assert_eq!(grouped.num_rows(), 3);
+    compare(
+        "MATCH (m:Memory)-[r:MENTIONS]->(e:Entity) WHERE m.memory_id = 'absent' RETURN e.entity_id",
+        &fixture,
+        true,
+    )
+    .await;
+    let text = "MATCH (a:Entity)-[r:REL]->(b:Entity) WHERE a.entity_id = $seed RETURN b.entity_id";
+    let baseline = query(text, &fixture, false)
+        .with_parameter("seed", "e1")
+        .execute_with_context_limited(context(&fixture), 1000)
+        .await
+        .unwrap();
+    let native = query(text, &fixture, true).with_parameter("seed", "e1");
+    let result = native
+        .execute_with_context_limited(context(&fixture), 1000)
+        .await
+        .unwrap();
+    assert_eq!(row_keys(&baseline), row_keys(&result));
+    assert_eq!(result.num_rows(), 2);
+    assert_eq!(
+        native
+            .csr_adjacency_metrics()
+            .native_multihop_executions
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn anonymous_relationships_use_join_plan_qualifiers() {
+    let fixture = fixture(false, false, 100, false).await;
+    let one = compare(
+        "MATCH (a:Entity {entity_id:'e0'})-[:REL]->(b:Entity) RETURN b.entity_id, b.name",
+        &fixture,
+        true,
+    )
+    .await;
+    assert_eq!(one.num_rows(), 1);
+    let mixed = compare(
+        "MATCH (a:Entity {entity_id:'e0'})-[:REL]->(b:Entity)-[r:REL]->(c:Entity)-[:REL]->(d:Entity) \
+         RETURN b.entity_id, c.entity_id, d.entity_id, r.edge_id",
+        &fixture,
+        true,
+    )
+    .await;
+    assert_eq!(mixed.num_rows(), 2);
+    // Same relationship type twice: rel_1 and rel_2 must not be confused.
+    let two = compare(
+        "MATCH (a:Entity)<-[:MENTIONS]-(m:Memory)-[:MENTIONS]->(b:Entity) \
+         WHERE a.entity_id = 'e0' AND b.entity_id <> 'e0' RETURN m.memory_id, b.entity_id",
+        &fixture,
+        true,
+    )
+    .await;
+    assert_eq!(two.num_rows(), 4); // m0 reaches e1 through both parallel e0 edges.
+                                   // A user variable named like a generated qualifier is not admitted.
+    compare(
+        "MATCH (rel_1:Entity {entity_id:'e0'})-[:REL]->(b:Entity) RETURN b.entity_id",
+        &fixture,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unseeded_or_target_bound_single_hop_keeps_join_plan() {
+    let fixture = fixture(false, false, 100, false).await;
+    for text in [
+        "MATCH (a:Entity)-[r:REL]->(b:Entity) RETURN a.entity_id, b.entity_id, r.edge_id",
+        "MATCH (a:Entity)-[r:REL]->(b:Entity {entity_id:'e2'}) RETURN a.entity_id, r.edge_id",
+        "MATCH (a:Entity)-[r:REL]->(b:Entity) WHERE a.entity_id = 'e0' OR b.entity_id = 'e2' \
+         RETURN a.entity_id, b.entity_id",
+        "MATCH (a:Entity {entity_id:'e0'})-[r:REL]-(b:Entity) RETURN b.entity_id",
+    ] {
+        let result = compare(text, &fixture, false).await;
+        assert!(result.num_rows() > 0, "{text}");
+    }
 }

@@ -2,9 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Storage-backed, nonempty fixed-path A/B/A, not AMS/LoCoMo or model latency.
-//! `cargo run -p lance-graph-benches --example native_csr_multihop -- 20000 200000`
+//! `cargo run --release -p lance-graph-benches --example native_csr_multihop -- [--id-btree] 2000 20000 200000`
 //! Both arms use the same data/version/lock/profile and existing single-hop CSR;
-//! only the native-multihop flag differs. Temporary datasets are scoped by RAII.
+//! only the native-path flag differs. Covers one-, two- and three-hop seeded
+//! paths plus shapes that must keep the JOIN plan (unseeded/target-bound,
+//! variable length). A query must run natively exactly when the library
+//! reports a seeded candidate shape; set BENCH_OBSERVE_ADMISSION=1 to measure
+//! older revisions that admit fewer shapes. Every timed run still checks the
+//! exact schema and result bag. Temporary datasets are scoped by RAII.
 
 use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -245,18 +250,36 @@ async fn main() {
             "data n={n} entity_rows={n} memory_rows={n} edge_rows={} versions={}/{}/{} node_id_btree={indexed} cache_budget_mib=512",
             n * 4, memories.version_id(), entities.version_id(), edges.version_id()
         );
-        for (name, text) in [
-            ("cooccurs2", "MATCH (a:Entity)<-[r1:MENTIONS]-(m:Memory)-[r2:MENTIONS]->(b:Entity) WHERE a.entity_id IN ['e0'] AND b.entity_id <> a.entity_id AND m.visible = true AND m.scope = 'user' AND b.allowed = true RETURN b.entity_id, m.memory_id, m.content, r1.edge_id, r2.edge_id"),
-            ("relation3", "MATCH (a:Entity {entity_id:'e0'})-[r1:REL]->(b:Entity)-[r2:REL]->(c:Entity)-[r3:REL]->(d:Entity) WHERE b.allowed = true AND c.allowed = true AND d.allowed = true RETURN b.entity_id, c.entity_id, d.entity_id, r1.edge_id, r2.edge_id, r3.edge_id"),
+        let seeds = (0..10)
+            .map(|i| format!("'m{i}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hop1_seeds = format!("MATCH (m:Memory)-[:MENTIONS]->(e:Entity) WHERE m.memory_id IN [{seeds}] AND m.visible = true RETURN m.memory_id, e.entity_id");
+        // (name, hops, seeded, text); unseeded shapes must keep the JOIN plan.
+        for (name, hops, seeded, text) in [
+            ("hop1_out", 1, true, "MATCH (a:Entity {entity_id:'e0'})-[r:REL]->(b:Entity) WHERE b.allowed = true RETURN b.entity_id, r.edge_id"),
+            ("hop1_in_acl", 1, true, "MATCH (e:Entity {entity_id:'e1'})<-[r:MENTIONS]-(m:Memory) WHERE m.visible = true AND m.scope = 'user' RETURN m.memory_id, m.content, r.edge_id"),
+            ("hop1_10seeds", 1, true, hop1_seeds.as_str()),
+            ("cooccurs2", 2, true, "MATCH (a:Entity)<-[r1:MENTIONS]-(m:Memory)-[r2:MENTIONS]->(b:Entity) WHERE a.entity_id IN ['e0'] AND b.entity_id <> a.entity_id AND m.visible = true AND m.scope = 'user' AND b.allowed = true RETURN b.entity_id, m.memory_id, m.content, r1.edge_id, r2.edge_id"),
+            ("relation2", 2, true, "MATCH (a:Entity {entity_id:'e0'})-[r1:REL]->(b:Entity)-[r2:REL]->(c:Entity) WHERE c.allowed = true RETURN b.entity_id, c.entity_id, r2.edge_id"),
+            ("relation3", 3, true, "MATCH (a:Entity {entity_id:'e0'})-[r1:REL]->(b:Entity)-[r2:REL]->(c:Entity)-[r3:REL]->(d:Entity) WHERE b.allowed = true AND c.allowed = true AND d.allowed = true RETURN b.entity_id, c.entity_id, d.entity_id, r1.edge_id, r2.edge_id, r3.edge_id"),
+            ("mention3", 3, true, "MATCH (m:Memory {memory_id:'m0'})-[:MENTIONS]->(a:Entity)-[:REL]->(b:Entity)-[:REL]->(c:Entity) WHERE c.allowed = true RETURN a.entity_id, b.entity_id, c.entity_id"),
+            ("hop1_target_bound", 1, false, "MATCH (a:Entity)-[r:REL]->(b:Entity {entity_id:'e5'}) RETURN a.entity_id, r.edge_id"),
+            ("varlen1_2", 2, false, "MATCH (a:Entity {entity_id:'e0'})-[:REL*1..2]->(b:Entity) RETURN b.entity_id"),
         ] {
             let make = |native| CypherQuery::new(text).unwrap().with_config(config.clone()).with_shared_csr_cache(cache.clone()).with_native_multihop(native);
+            let expect_native = seeded && make(true).native_multihop_candidate();
             let baseline = make(false).with_shared_csr_cache(Arc::new(CsrAdjacencyCache::new(cache_options.clone()))).execute_with_catalog_and_context(catalog.clone(), SessionContext::new()).await.unwrap();
-            assert!(baseline.num_rows() > 0);
+            assert!(baseline.num_rows() > 0, "{name}");
             let start = Instant::now(); let cold = make(true);
             let first = cold.execute_with_catalog_and_context(catalog.clone(), SessionContext::new()).await.unwrap();
             assert_eq!(baseline.schema(), first.schema()); assert_eq!(bag(&baseline), bag(&first));
-            assert_eq!(cold.csr_adjacency_metrics().native_multihop_executions.load(Ordering::Relaxed), 1, "native admission/execution: {:?}", cold.csr_adjacency_metrics());
-            println!("cold n={n} query={name} ms={:.3} builds={} rows={}", start.elapsed().as_secs_f64()*1000., cold.csr_adjacency_metrics().build_count.load(Ordering::Relaxed), first.num_rows());
+            // Older revisions admit fewer shapes than their hint reports; with
+            // BENCH_OBSERVE_ADMISSION=1 record the actual admission instead.
+            let actual = cold.csr_adjacency_metrics().native_multihop_executions.load(Ordering::Relaxed) == 1;
+            let expect_native = if std::env::var_os("BENCH_OBSERVE_ADMISSION").is_some() { expect_native && actual } else { expect_native };
+            assert_eq!(actual, expect_native, "native admission/execution of {name}: {:?}", cold.csr_adjacency_metrics());
+            println!("cold n={n} query={name} hops={hops} ms={:.3} builds={} rows={}", start.elapsed().as_secs_f64()*1000., cold.csr_adjacency_metrics().build_count.load(Ordering::Relaxed), first.num_rows());
             for (arm, native) in [("old1", false), ("native", true), ("old2", false)] {
                 for _ in 0..5 { make(native).execute_with_catalog_and_context(catalog.clone(), SessionContext::new()).await.unwrap(); }
                 let mut samples = Vec::new(); let mut inputs = 0; let mut bytes = 0; let mut checks = 0; let mut index_reads = 0; let mut take_reads = 0;
@@ -266,15 +289,15 @@ async fn main() {
                     samples.push(start.elapsed().as_secs_f64()*1000.);
                     assert_eq!(baseline.schema(), result.schema()); assert_eq!(bag(&baseline), bag(&result));
                     let metrics = q.csr_adjacency_metrics();
-                    assert_eq!(metrics.native_multihop_executions.load(Ordering::Relaxed), u64::from(native));
+                    assert_eq!(metrics.native_multihop_executions.load(Ordering::Relaxed), u64::from(native && expect_native));
                     assert_eq!(metrics.native_multihop_fallbacks.load(Ordering::Relaxed), 0);
-                    if native && indexed { assert!(metrics.native_multihop_node_index_reads.load(Ordering::Relaxed) >= 1); }
+                    if native && expect_native && indexed { assert!(metrics.native_multihop_node_index_reads.load(Ordering::Relaxed) >= 1); }
                     index_reads += metrics.native_multihop_node_index_reads.load(Ordering::Relaxed); take_reads += metrics.native_multihop_node_take_reads.load(Ordering::Relaxed);
                     inputs += metrics.native_multihop_input_rows.load(Ordering::Relaxed); bytes += metrics.native_multihop_input_bytes.load(Ordering::Relaxed); checks += metrics.native_multihop_edge_checks.load(Ordering::Relaxed);
                 }
                 let raw = samples.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(",");
                 samples.sort_by(f64::total_cmp);
-                println!("hot n={n} query={name} arm={arm} p50_ms={:.3} p95_ms={:.3} rows={} native={} fallback=0 input_rows_avg={} arrow_bytes_avg={} edge_checks_avg={} node_id_btree_reads_avg={} node_id_take_reads_avg={} raw_ms=[{raw}]", (samples[9]+samples[10])/2., samples[18], baseline.num_rows(), native, inputs / 20, bytes / 20, checks / 20, index_reads / 20, take_reads / 20);
+                println!("hot n={n} query={name} hops={hops} arm={arm} p50_ms={:.3} p95_ms={:.3} rows={} native={} fallback=0 input_rows_avg={} arrow_bytes_avg={} edge_checks_avg={} node_id_btree_reads_avg={} node_id_take_reads_avg={} raw_ms=[{raw}]", (samples[9]+samples[10])/2., samples[18], baseline.num_rows(), native && expect_native, inputs / 20, bytes / 20, checks / 20, index_reads / 20, take_reads / 20);
             }
         }
     }

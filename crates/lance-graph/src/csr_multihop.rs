@@ -66,7 +66,7 @@ pub(crate) fn supports_query(ast: &QueryAst) -> bool {
     }
     matches!(&ast.reading_clauses[0], ReadingClause::Match(clause)
         if clause.patterns.len() == 1 && matches!(&clause.patterns[0], GraphPattern::Path(path)
-            if (2..=3).contains(&path.segments.len()) && path.segments.iter().all(|s| s.relationship.length.is_none())))
+            if (1..=3).contains(&path.segments.len()) && path.segments.iter().all(|s| s.relationship.length.is_none())))
 }
 
 #[derive(Debug, Clone)]
@@ -239,7 +239,7 @@ pub(crate) fn try_source(
         chain.push(root);
         root = input;
     }
-    if !(2..=3).contains(&chain.len()) {
+    if !(1..=3).contains(&chain.len()) {
         return Ok(None);
     }
     chain.reverse();
@@ -303,6 +303,12 @@ pub(crate) fn try_source(
     let mut edge_dataset: Option<Arc<Dataset>> = None;
     let mut endpoints: Option<(String, String)> = None;
     let mut previous = variable.clone();
+    // Anonymous relationships use the same `type_N` qualifier as the JOIN
+    // plan; resolve it on a probe so `ctx` only advances on admission.
+    let mut instances = PlanningContext {
+        analysis: ctx.analysis,
+        relationship_instance_idx: ctx.relationship_instance_idx.clone(),
+    };
     for expand in &chain {
         let LogicalOperator::Expand {
             source_variable,
@@ -318,11 +324,14 @@ pub(crate) fn try_source(
         else {
             unreachable!()
         };
-        let Some(alias) = relationship_variable else {
+        if relationship_types.len() != 1 {
+            return Ok(None);
+        }
+        let Ok(instance) = instances.next_relationship_instance(&relationship_types[0]) else {
             return Ok(None);
         };
+        let alias = relationship_variable.as_ref().unwrap_or(&instance.alias);
         if source_variable != &previous
-            || relationship_types.len() != 1
             || matches!(direction, RelationshipDirection::Undirected)
             || alias.contains("__")
             || target_variable.contains("__")
