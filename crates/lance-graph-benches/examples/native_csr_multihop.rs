@@ -8,8 +8,9 @@
 //! paths plus shapes that must keep the JOIN plan (unseeded/target-bound,
 //! variable length). A query must run natively exactly when the library
 //! reports a seeded candidate shape; set BENCH_OBSERVE_ADMISSION=1 to measure
-//! older revisions that admit fewer shapes. Every timed run still checks the
-//! exact schema and result bag. Temporary datasets are scoped by RAII.
+//! older revisions that admit fewer shapes or miss node-ID BTrees, and
+//! BENCH_QUERIES=a,b to run a subset. Every timed run still checks the exact
+//! schema and result bag. Temporary datasets are scoped by RAII.
 
 use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -267,6 +268,10 @@ async fn main() {
             ("hop1_target_bound", 1, false, "MATCH (a:Entity)-[r:REL]->(b:Entity {entity_id:'e5'}) RETURN a.entity_id, r.edge_id"),
             ("varlen1_2", 2, false, "MATCH (a:Entity {entity_id:'e0'})-[:REL*1..2]->(b:Entity) RETURN b.entity_id"),
         ] {
+            // Optional comma-separated subset, e.g. BENCH_QUERIES=hop1_out,relation3.
+            if std::env::var("BENCH_QUERIES").is_ok_and(|names| !names.split(',').any(|q| q == name)) {
+                continue;
+            }
             let make = |native| CypherQuery::new(text).unwrap().with_config(config.clone()).with_shared_csr_cache(cache.clone()).with_native_multihop(native);
             let expect_native = seeded && make(true).native_multihop_candidate();
             let baseline = make(false).with_shared_csr_cache(Arc::new(CsrAdjacencyCache::new(cache_options.clone()))).execute_with_catalog_and_context(catalog.clone(), SessionContext::new()).await.unwrap();
@@ -277,7 +282,8 @@ async fn main() {
             // Older revisions admit fewer shapes than their hint reports; with
             // BENCH_OBSERVE_ADMISSION=1 record the actual admission instead.
             let actual = cold.csr_adjacency_metrics().native_multihop_executions.load(Ordering::Relaxed) == 1;
-            let expect_native = if std::env::var_os("BENCH_OBSERVE_ADMISSION").is_some() { expect_native && actual } else { expect_native };
+            let observe = std::env::var_os("BENCH_OBSERVE_ADMISSION").is_some();
+            let expect_native = if observe { expect_native && actual } else { expect_native };
             assert_eq!(actual, expect_native, "native admission/execution of {name}: {:?}", cold.csr_adjacency_metrics());
             println!("cold n={n} query={name} hops={hops} ms={:.3} builds={} rows={}", start.elapsed().as_secs_f64()*1000., cold.csr_adjacency_metrics().build_count.load(Ordering::Relaxed), first.num_rows());
             for (arm, native) in [("old1", false), ("native", true), ("old2", false)] {
@@ -291,7 +297,7 @@ async fn main() {
                     let metrics = q.csr_adjacency_metrics();
                     assert_eq!(metrics.native_multihop_executions.load(Ordering::Relaxed), u64::from(native && expect_native));
                     assert_eq!(metrics.native_multihop_fallbacks.load(Ordering::Relaxed), 0);
-                    if native && expect_native && indexed { assert!(metrics.native_multihop_node_index_reads.load(Ordering::Relaxed) >= 1); }
+                    if native && expect_native && indexed && !observe { assert!(metrics.native_multihop_node_index_reads.load(Ordering::Relaxed) >= 1); }
                     index_reads += metrics.native_multihop_node_index_reads.load(Ordering::Relaxed); take_reads += metrics.native_multihop_node_take_reads.load(Ordering::Relaxed);
                     inputs += metrics.native_multihop_input_rows.load(Ordering::Relaxed); bytes += metrics.native_multihop_input_bytes.load(Ordering::Relaxed); checks += metrics.native_multihop_edge_checks.load(Ordering::Relaxed);
                 }
