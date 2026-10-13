@@ -111,7 +111,11 @@ def edge_version(graph):
 @pytest.mark.parametrize("column_cache", [0, 16 << 20])
 @pytest.mark.parametrize("name", sorted(QUERIES))
 def test_snapshot_matches_join_plan(graph, name, column_cache):
-    provider = make_provider(graph, max_column_cache_bytes=column_cache)
+    provider = make_provider(
+        graph,
+        max_column_cache_bytes=column_cache,
+        column_cache_background_fill=False,
+    )
     snapshot = provider.latest()
     assert isinstance(snapshot, GraphSnapshot)
     expected = join_result(graph, QUERIES[name])
@@ -132,7 +136,7 @@ def test_snapshot_matches_join_plan(graph, name, column_cache):
 def test_warm_and_cache_stats(graph):
     provider = make_provider(graph)
     report = provider.latest().warm()
-    assert report == {"adjacency": 1, "node_ids": 1, "skipped": 0}
+    assert report == {"adjacency": 1, "node_ids": 1, "skipped": 0, "columns": 0}
     stats = provider.cache_stats()
     assert set(stats) == {
         "entries",
@@ -264,7 +268,9 @@ def test_invalid_versions_are_errors(graph):
 
 
 def test_concurrent_queries_share_one_provider(graph):
-    provider = make_provider(graph, max_column_cache_bytes=16 << 20)
+    provider = make_provider(
+        graph, max_column_cache_bytes=16 << 20, column_cache_background_fill=False
+    )
     expected = {name: rows(join_result(graph, text)) for name, text in QUERIES.items()}
 
     def run(i):
@@ -276,10 +282,40 @@ def test_concurrent_queries_share_one_provider(graph):
     for name, result in results:
         assert result == expected[name]
     # Concurrent first use builds every entry once, like a sequential run.
-    sequential = make_provider(graph, max_column_cache_bytes=16 << 20)
+    sequential = make_provider(
+        graph, max_column_cache_bytes=16 << 20, column_cache_background_fill=False
+    )
     for text in QUERIES.values():
         sequential.latest().execute(text)
     concurrent_stats = provider.cache_stats()
     sequential_stats = sequential.cache_stats()
     for key in ("full_builds", "entries", "column_entries"):
         assert concurrent_stats[key] == sequential_stats[key], key
+
+
+def test_column_cache_warm_and_background_fill(graph):
+    """warm() loads node ID columns, warm_columns() hot properties; with
+    background fill a cold column is served from storage first and every
+    read equals the JOIN plan."""
+    provider = make_provider(graph, max_column_cache_bytes=16 << 20)
+    snapshot = provider.latest()
+    report = snapshot.warm()
+    assert report["columns"] == 1 and report["skipped"] == 0
+    assert snapshot.warm_columns("person", ["name", "age"]) == 2
+    assert snapshot.warm_columns("KNOWS", ["since"]) == 1
+    assert snapshot.warm_columns("Unknown", ["name"]) == 0
+    assert provider.cache_stats()["column_entries"] == 4
+    for text in QUERIES.values():
+        for _ in range(3):
+            assert rows(snapshot.execute(text)) == rows(join_result(graph, text))
+    # A column cap smaller than any column caches nothing, results unchanged.
+    capped = make_provider(
+        graph,
+        max_column_cache_bytes=16 << 20,
+        max_column_bytes_per_column=16,
+        column_cache_background_fill=False,
+    )
+    capped_snapshot = capped.latest()
+    for text in QUERIES.values():
+        assert rows(capped_snapshot.execute(text)) == rows(join_result(graph, text))
+    assert capped.cache_stats()["column_entries"] == 0

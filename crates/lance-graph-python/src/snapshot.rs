@@ -121,8 +121,9 @@ impl GraphSnapshot {
         }
     }
 
-    /// Build every relationship adjacency and node-ID map of these versions.
-    /// Returns ``{"adjacency": n, "node_ids": n, "skipped": n}``.
+    /// Build every relationship adjacency and node-ID map of these versions
+    /// (and load node ID columns when the column cache is enabled). Returns
+    /// ``{"adjacency": n, "node_ids": n, "skipped": n, "columns": n}``.
     fn warm(&self, py: Python) -> PyResult<HashMap<String, usize>> {
         let snapshot = self.inner.clone();
         let report = RT.block_on(Some(py), async move { snapshot.warm().await })?;
@@ -130,7 +131,25 @@ impl GraphSnapshot {
             ("adjacency".to_owned(), report.adjacency),
             ("node_ids".to_owned(), report.node_ids),
             ("skipped".to_owned(), report.skipped),
+            ("columns".to_owned(), report.columns),
         ]))
+    }
+
+    /// Load stored columns of the table behind a node label or relationship
+    /// type into the column cache, e.g. properties most queries return or
+    /// filter on. Returns how many are cached (0 for an unknown label).
+    fn warm_columns(
+        &self,
+        py: Python,
+        label_or_type: &str,
+        columns: Vec<String>,
+    ) -> PyResult<usize> {
+        let snapshot = self.inner.clone();
+        let label = label_or_type.to_owned();
+        RT.block_on(Some(py), async move {
+            let names = columns.iter().map(String::as_str).collect::<Vec<_>>();
+            snapshot.warm_columns(&label, &names).await
+        })
     }
 
     /// Execute a Cypher query (text or ``CypherQuery``) on these versions.
@@ -199,6 +218,11 @@ impl GraphSnapshotProvider {
     ///     (peak of one cold build). Defaults as in the Rust ``CsrScanOptions``.
     /// max_column_cache_bytes : int
     ///     Property column cache budget; 0 disables it.
+    /// max_column_bytes_per_column : int
+    ///     Largest single cached column; 0 allows the whole budget.
+    /// column_cache_background_fill : bool
+    ///     Load a missing column in the background and serve that query from
+    ///     storage (default), instead of waiting for the load.
     #[new]
     #[pyo3(signature = (
         namespace,
@@ -211,6 +235,8 @@ impl GraphSnapshotProvider {
         max_cache_rows=None,
         max_cache_slots=None,
         max_column_cache_bytes=0,
+        max_column_bytes_per_column=0,
+        column_cache_background_fill=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -224,6 +250,8 @@ impl GraphSnapshotProvider {
         max_cache_rows: Option<usize>,
         max_cache_slots: Option<usize>,
         max_column_cache_bytes: usize,
+        max_column_bytes_per_column: usize,
+        column_cache_background_fill: bool,
     ) -> Self {
         let defaults = CsrScanOptions::default();
         let options = CsrScanOptions {
@@ -233,6 +261,8 @@ impl GraphSnapshotProvider {
             max_cache_rows: max_cache_rows.unwrap_or(defaults.max_cache_rows),
             max_cache_slots: max_cache_slots.unwrap_or(defaults.max_cache_slots),
             max_column_cache_bytes,
+            max_column_bytes_per_column,
+            column_cache_background_fill,
             ..defaults
         };
         let mut provider =
